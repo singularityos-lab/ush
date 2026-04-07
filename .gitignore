@@ -1,0 +1,26 @@
+# Compiled binaries
+/ush
+/ush-broker
+/ush-static
+/ush-broker-static
+
+# Go
+vendor/
+*.test
+*.out
+coverage.*
+
+# Logs and session dumps
+*.log
+typescript
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# build artifacts
+/ush
+/ush-broker
+*.so

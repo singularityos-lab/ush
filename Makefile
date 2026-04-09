@@ -79,4 +79,3 @@ fmt:
 
 vet:
 	@go vet ./...
-

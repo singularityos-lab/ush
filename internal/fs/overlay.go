@@ -814,3 +814,340 @@ func (g *GuestFS) bindHome() error {
 		"home", g.HomeDir)
 	return nil
 }
+
+// isTrustedDevDir reports whether host path p is at or below a user-trusted
+// developer directory.
+func (g *GuestFS) isTrustedDevDir(p string) bool {
+	p = filepath.Clean(p)
+	for _, d := range g.TrustedDevDirs {
+		d = filepath.Clean(d)
+		if p == d || strings.HasPrefix(p, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// bindTrustedDevDirs binds each user-confirmed developer directory read-write
+// straight from the host, with NO VCS-metadata isolation: the user has vouched
+// for it and wants to build, run and commit there normally. These dirs are also
+// reported to the supervisor as exec-strip exemptions, so executables created
+// here stay runnable. Granting them is gated by a host-side broker confirmation,
+// so a compromised guest cannot expose arbitrary host paths to itself.
+func (g *GuestFS) bindTrustedDevDirs() error {
+	for _, dir := range g.TrustedDevDirs {
+		dir = filepath.Clean(dir)
+		fi, err := os.Stat(dir)
+		if err != nil || !fi.IsDir() {
+			ushlog.Warn("fs: trusted dev dir missing, skipping", "dir", dir)
+			continue
+		}
+		dst := filepath.Join(g.GuestRoot, dir)
+		if err := os.MkdirAll(dst, 0755); err != nil {
+			ushlog.Warn("fs: trusted dev dir mkdir failed", "dir", dir, "err", err)
+			continue
+		}
+		if err := bindMount(dir, dst, false); err != nil {
+			ushlog.Warn("fs: trusted dev dir bind failed", "dir", dir, "err", err)
+			continue
+		}
+		ushlog.Info("fs: trusted dev dir bound (full host access)", "dir", dir)
+	}
+	return nil
+}
+
+// HostBackedRWGuestPaths returns the guest-absolute paths that are bound RAW
+// read-write straight from the host, i.e. where a guest write lands on a real
+// host file the host could later run. The supervisor strips the executable bit
+// from anything the guest makes executable under them.
+//
+// With the home data dirs write-isolated by default (overlay), the only raw
+// host read-write surface left is an explicit `:rw` extra bind. The shared data
+// dirs are overlays (writes diverge into a guest-private layer, so they cannot
+// produce a host-runnable file and need no stripping), and trusted dev dirs are
+// full-access on purpose (exempt). The guest's own private areas are likewise
+// never listed.
+func (g *GuestFS) HostBackedRWGuestPaths() []string {
+	var out []string
+	for _, spec := range g.ExtraBinds {
+		parts := strings.Split(strings.TrimSpace(spec), ":")
+		if len(parts) >= 3 && parts[2] == "rw" && parts[1] != "" {
+			out = append(out, parts[1])
+		}
+	}
+	return out
+}
+
+// bindPkgLayer re-exposes the package install root (pkgroot) into the guest.
+// `pkg install` puts binaries under <storage>/layers/persistent/pkgroot, which
+// lives below the real home, now hidden by the isolated guest home. Without
+// this rebind, pkg-installed apps (e.g. `code`) vanish from PATH even though
+// they are installed. Only the pkgroot subtree is exposed, RW so installs keep
+// working; ush's policy/audit/layers state stays out of the guest.
+func (g *GuestFS) bindPkgLayer() error {
+	src := filepath.Join(g.LayerDir, "persistent", "pkgroot")
+	if _, err := os.Stat(src); err != nil {
+		return nil // nothing installed yet
+	}
+	dst := filepath.Join(g.GuestRoot, src)
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return fmt.Errorf("fs: pkgroot mkdir: %w", err)
+	}
+	if err := bindMount(src, dst, false); err != nil {
+		return fmt.Errorf("fs: bind pkgroot: %w", err)
+	}
+	ushlog.Info("fs: pkg layer exposed to guest", "pkgroot", src)
+	return nil
+}
+
+// applyExtraBinds mounts the user-declared host paths into the guest. Each entry
+// is "host_path:guest_path[:MODE]".
+//
+// The guest is less trusted than the host, yet a plain read-write bind lets it
+// modify host files that host-privileged code may later read or EXECUTE (config
+// dirs, hooks, plugin trees, autostart, ...). That is a generic sandbox -> host
+// escape, not specific to any one app: the openat broker only mediates /dev/*,
+// so writes to any host-backed mount are otherwise unmediated. So the SAFE
+// behaviour is the DEFAULT and raw host writes must be opted into explicitly:
+//
+//   - (default)  directories are write-isolated via overlay: the guest reads the
+//     whole host tree but every write diverges into a guest-private
+//     upper layer, so the host directory is NEVER modified, whatever
+//     path the guest targets. Files default to read-only. This closes
+//     the write surface by construction, not path by path.
+//   - ro         read-only bind (run/read host files, never modify them).
+//   - rw         EXPLICIT raw read-write into the host. The guest can modify host
+//     files; only use it for data you intentionally want written back
+//     to the host. Logged loudly.
+//
+// If an overlay cannot be mounted (e.g. the host tree contains nested mounts) we
+// fall back to read-only, never to writable. It runs after bindHome so binds onto
+// paths inside the (isolated) guest home land correctly.
+func (g *GuestFS) applyExtraBinds() error {
+	for _, spec := range g.ExtraBinds {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		parts := strings.Split(spec, ":")
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			ushlog.Warn("fs: bad extra bind, want host:guest[:ro|:rw]", "spec", spec)
+			continue
+		}
+		src, guestPath := parts[0], parts[1]
+		mode := "default"
+		if len(parts) >= 3 && parts[2] != "" {
+			mode = parts[2]
+		}
+		// "overlay" is accepted as an explicit spelling of the default.
+		if mode == "overlay" {
+			mode = "default"
+		}
+
+		fi, err := os.Stat(src)
+		if err != nil {
+			ushlog.Warn("fs: extra bind source missing, skipping", "src", src, "err", err)
+			continue
+		}
+		dst := filepath.Join(g.GuestRoot, guestPath)
+
+		// Directories: default to write-isolated overlay; rw/ro on request.
+		if fi.IsDir() {
+			switch mode {
+			case "rw":
+				os.MkdirAll(dst, 0755)
+				if err := bindMount(src, dst, false); err != nil {
+					ushlog.Warn("fs: extra bind failed", "src", src, "guest", guestPath, "err", err)
+					continue
+				}
+				ushlog.Warn("fs: extra bind is RAW read-write into the host; guest can modify host files",
+					"src", src, "guest", guestPath)
+			case "ro":
+				os.MkdirAll(dst, 0755)
+				if err := bindMount(src, dst, true); err != nil {
+					ushlog.Warn("fs: extra bind failed", "src", src, "guest", guestPath, "err", err)
+					continue
+				}
+				ushlog.Info("fs: extra bind applied (ro)", "src", src, "guest", guestPath)
+			default:
+				if err := g.overlayExpose(src, dst); err != nil {
+					// Fail safe: read-only, never writable.
+					ushlog.Warn("fs: overlay failed, falling back to read-only", "src", src, "err", err)
+					os.MkdirAll(dst, 0755)
+					if e2 := bindMount(src, dst, true); e2 != nil {
+						ushlog.Warn("fs: extra bind ro fallback failed", "src", src, "err", e2)
+						continue
+					}
+				}
+				ushlog.Info("fs: extra bind applied (write-isolated, host read-only)", "src", src, "guest", guestPath)
+			}
+			continue
+		}
+
+		// Files: default read-only (overlay is directory-only); rw on request.
+		ro := mode != "rw"
+		os.MkdirAll(filepath.Dir(dst), 0755)
+		if f, e := os.OpenFile(dst, os.O_CREATE, 0644); e == nil {
+			f.Close()
+		}
+		if err := bindMount(src, dst, ro); err != nil {
+			ushlog.Warn("fs: extra bind failed", "src", src, "guest", guestPath, "err", err)
+			continue
+		}
+		if !ro {
+			ushlog.Warn("fs: extra file bind is RAW read-write into the host", "src", src, "guest", guestPath)
+		} else {
+			ushlog.Info("fs: extra file bind applied (ro)", "src", src, "guest", guestPath)
+		}
+	}
+	return nil
+}
+
+// overlayExpose mounts an overlayfs at dst whose lower layer is the host
+// directory lower (read-only) and whose upper/work layers are private to the
+// guest. The guest sees and reads the entire host tree, but every write diverges
+// into the guest-private upper layer: the host directory is NEVER modified, no
+// matter which path under it the guest writes. This closes a whole class of
+// "guest writes what host-privileged code later executes" escapes by
+// construction, instead of enumerating individual dangerous paths (a denylist
+// that can always be defeated by a host-config layout we did not anticipate,
+// e.g. hooks/, settings*.json, plugins/, marketplaces/, cache/).
+//
+// The upper/work layers live under the persistent layer so the guest's own state
+// (sessions, history) survives across runs; anything malicious it writes there
+// stays guest-private and only ever runs inside the guest.
+func (g *GuestFS) overlayExpose(lower, dst string) error {
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return err
+	}
+	key := strings.Trim(strings.ReplaceAll(strings.TrimPrefix(dst, g.GuestRoot), "/", "_"), "_")
+	base := filepath.Join(g.LayerDir, "persistent", "overlay", key)
+	upper := filepath.Join(base, "upper")
+	work := filepath.Join(base, "work")
+	if err := os.MkdirAll(upper, 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(work, 0755); err != nil {
+		return err
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work)
+	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err != nil {
+		return fmt.Errorf("overlay mount %s: %w", dst, err)
+	}
+	return nil
+}
+
+// sharedHomeSubdirs returns the top-level directories of the real home to expose
+// into the guest home. Because ush is a shell and the user navigates the whole
+// home with `cd`, this is EVERY non-dot top-level directory (Projects, Documents,
+// Downloads, code, ...), not a fixed XDG list: the user must see real files
+// wherever they cd.
+//
+// The single structural rule is "skip dotfiles/dotdirs": ~/.ssh, ~/.gnupg,
+// ~/.aws (secrets) and ~/.bashrc, ~/.config/autostart, ~/.config/systemd/user
+// (auto-execution surface) stay the guest's own, never the host's. One rule, not
+// a growing denylist. Everything returned here is exposed write-isolated
+// (overlay) by bindHome; `perm trust-dir` opts a subtree into full read-write.
+func (g *GuestFS) sharedHomeSubdirs() []string {
+	if g.HomeDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(g.HomeDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue // the home secrets + auto-injection surface stays private
+		}
+		// Only directories; loose files in the home root stay private. Resolve
+		// symlinks so a symlinked data dir still counts as a directory.
+		info, statErr := os.Stat(filepath.Join(g.HomeDir, name))
+		if statErr != nil || !info.IsDir() {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// bindDevices mounts necessary device files in the guest.
+// deviceBind is one host device node (or dir) to expose in the guest /dev.
+type deviceBind struct {
+	src, dst string
+	ro       bool
+}
+
+// touch creates an empty file at path (a bind target), reporting success.
+func touch(path string) bool {
+	f, err := os.OpenFile(path, os.O_CREATE, 0666)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+func (g *GuestFS) bindDevices() error {
+	dev := filepath.Join(g.GuestRoot, "dev")
+	binds := []deviceBind{
+		{"/dev/null", filepath.Join(dev, "null"), false},
+		{"/dev/zero", filepath.Join(dev, "zero"), false},
+		{"/dev/full", filepath.Join(dev, "full"), false},
+		{"/dev/urandom", filepath.Join(dev, "urandom"), false},
+		{"/dev/random", filepath.Join(dev, "random"), false},
+		{"/dev/tty", filepath.Join(dev, "tty"), false},
+	}
+
+	// Developer (dsh) profile: expose /dev/fuse so fuse-overlayfs (the storage
+	// driver rootless podman uses) works inside the dev world.
+	if g.DevProfile {
+		if _, err := os.Stat("/dev/fuse"); err == nil {
+			fuseDst := filepath.Join(dev, "fuse")
+			touch(fuseDst)
+			binds = append(binds, deviceBind{"/dev/fuse", fuseDst, false})
+		}
+	}
+
+	g.setupDevpts()
+
+	// TUN/TAP: needed for pasta network.
+	if _, err := os.Stat("/dev/net/tun"); err == nil {
+		tunDir := filepath.Join(dev, "net")
+		os.MkdirAll(tunDir, 0755)
+		tunDst := filepath.Join(tunDir, "tun")
+		if touch(tunDst) {
+			binds = append(binds, deviceBind{"/dev/net/tun", tunDst, false})
+		}
+	}
+
+	// GPU: bind /dev/dri if present.
+	if _, err := os.Stat("/dev/dri"); err == nil {
+		binds = append(binds, deviceBind{"/dev/dri", filepath.Join(dev, "dri"), false})
+	}
+
+	// Audio: bind /dev/snd if present.
+	if _, err := os.Stat("/dev/snd"); err == nil {
+		sndDst := filepath.Join(dev, "snd")
+		os.MkdirAll(sndDst, 0755)
+		binds = append(binds, deviceBind{"/dev/snd", sndDst, false})
+	}
+
+	for _, b := range binds {
+		fi, err := os.Lstat(b.src)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if fi != nil && !fi.IsDir() {
+			touch(b.dst)
+		}
+		if err := bindMount(b.src, b.dst, b.ro); err != nil {
+			ushlog.Warn("fs: bind device failed", "src", b.src, "err", err)
+		}
+	}
+
+	g.setupDevShm()
+	return nil
+}

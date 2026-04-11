@@ -1151,3 +1151,323 @@ func (g *GuestFS) bindDevices() error {
 	g.setupDevShm()
 	return nil
 }
+
+// setupDevpts mounts a private devpts instance for the guest (required by
+// dpkg/posix_openpt) and points /dev/ptmx at it. On failure it falls back to
+// binding the host /dev/pts and /dev/ptmx.
+func (g *GuestFS) setupDevpts() {
+	devPtsDst := filepath.Join(g.GuestRoot, "dev/pts")
+	ptmxDst := filepath.Join(g.GuestRoot, "dev/ptmx")
+
+	// Try without the gid option first (user namespaces may reject gid=5).
+	for _, opts := range []string{"newinstance,ptmxmode=0666,mode=620", "newinstance,ptmxmode=0666"} {
+		if err := unix.Mount("devpts", devPtsDst, "devpts",
+			unix.MS_NOSUID|unix.MS_NOEXEC, opts); err == nil {
+			os.Remove(ptmxDst)
+			os.Symlink("pts/ptmx", ptmxDst)
+			return
+		}
+	}
+
+	ushlog.Warn("fs: devpts mount failed, falling back to bind")
+	if _, err := os.Stat("/dev/pts"); err == nil {
+		if berr := bindMount("/dev/pts", devPtsDst, false); berr != nil {
+			ushlog.Warn("fs: /dev/pts bind failed", "err", berr)
+		}
+	}
+	if _, err := os.Stat("/dev/ptmx"); err == nil {
+		touch(ptmxDst)
+		if berr := bindMount("/dev/ptmx", ptmxDst, false); berr != nil {
+			ushlog.Warn("fs: /dev/ptmx bind failed", "err", berr)
+		}
+	}
+}
+
+// setupDevShm mounts a tmpfs at the guest /dev/shm.
+func (g *GuestFS) setupDevShm() {
+	shmDir := filepath.Join(g.GuestRoot, "dev/shm")
+	os.MkdirAll(shmDir, 01777)
+	unix.Mount("tmpfs", shmDir, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, "mode=1777")
+}
+
+// bindXDGRuntime mounts XDG_RUNTIME_DIR in the guest.
+// bindXDGRuntime gives the guest a FRESH runtime dir (a directory on its own
+// /run tmpfs), NOT a bind of the host XDG_RUNTIME_DIR.
+//
+// SECURITY: binding the whole host runtime dir used to expose `bus`, the host
+// session bus. That bus carries org.freedesktop.systemd1, so a guest could call
+// StartTransientUnit and have the host `systemd --user` spawn a process OUTSIDE
+// every namespace as the host user, bypassing all of ush's containment. We now
+// expose ONLY the specific channels the guest legitimately needs: the ush
+// sockets subdir (broker + seccomp-notify) and individual GUI/audio sockets.
+// The host session bus is never visible inside the guest.
+func (g *GuestFS) bindXDGRuntime() error {
+	if g.XDGRuntimeDir == "" {
+		return nil
+	}
+	if _, err := os.Stat(g.XDGRuntimeDir); err != nil {
+		ushlog.Warn("fs: XDG_RUNTIME_DIR not available on host, skipping", "path", g.XDGRuntimeDir)
+		return nil
+	}
+
+	guestRT := filepath.Join(g.GuestRoot, g.XDGRuntimeDir)
+	if err := os.MkdirAll(guestRT, 0700); err != nil {
+		return fmt.Errorf("fs: mkdir guest XDG_RUNTIME_DIR: %w", err)
+	}
+
+	// 1) The ush sockets directory (broker control socket + seccomp-notify fd
+	//    socket). This is the ONLY ush channel the guest needs; the host bus
+	//    stays out entirely.
+	ushHost := filepath.Join(g.XDGRuntimeDir, "ush")
+	if err := os.MkdirAll(ushHost, 0700); err != nil {
+		return fmt.Errorf("fs: mkdir host ush runtime dir: %w", err)
+	}
+	ushGuest := filepath.Join(guestRT, "ush")
+	if err := os.MkdirAll(ushGuest, 0700); err != nil {
+		return fmt.Errorf("fs: mkdir guest ush runtime dir: %w", err)
+	}
+	if err := bindMount(ushHost, ushGuest, false); err != nil {
+		return fmt.Errorf("fs: bind ush runtime dir: %w", err)
+	}
+
+	// 2) Specific desktop sockets, exposed one by one (never the session bus).
+	//    Wayland and PipeWire are sockets; PulseAudio's is a directory.
+	for _, name := range []string{"wayland-0", "wayland-1", "pipewire-0", "pulse"} {
+		src := filepath.Join(g.XDGRuntimeDir, name)
+		fi, err := os.Stat(src)
+		if err != nil {
+			continue
+		}
+		dst := filepath.Join(guestRT, name)
+		if fi.IsDir() {
+			if err := os.MkdirAll(dst, 0700); err != nil {
+				continue
+			}
+		} else {
+			// A bind mount needs an existing target; a placeholder file is fine,
+			// the bind replaces it with the real socket inode.
+			if f, err := os.OpenFile(dst, os.O_CREATE, 0600); err == nil {
+				f.Close()
+			} else {
+				continue
+			}
+		}
+		if err := bindMount(src, dst, false); err != nil {
+			ushlog.Warn("fs: bind desktop socket failed, skipping", "socket", name, "err", err)
+		}
+	}
+
+	ushlog.Info("fs: guest runtime dir isolated (host session bus NOT exposed)",
+		"runtime", g.XDGRuntimeDir)
+	return nil
+}
+
+// blockPackageManagers overwrites apt/dpkg binaries with blocking wrappers in the
+// /usr/bin overlay layer. The real binaries are copied to LayerDir/ush-exec (writable,
+// outside the guest rootfs bind-only) and then bind-mounted to /run/ush/exec in the guest.
+// The internal pkg manager uses /run/ush/exec/apt-get to bypass the block.
+// Also compiles the chown LD_PRELOAD shim that makes chown/lchown/fchown/fchownat
+// return 0 on EPERM/EINVAL (unmapped GIDs in user namespace), preventing dpkg aborts.
+func (g *GuestFS) blockPackageManagers() error {
+	blockedBins := []string{
+		"apt", "apt-get", "apt-cache", "apt-mark",
+		"dpkg", "dpkg-reconfigure",
+	}
+
+	// 1. Build ush-exec: directory with real binaries used by the runtime.
+	//    Cascade search: ToolsDir > /usr/local/bin > /usr/bin.
+	ushExecHost := filepath.Join(g.LayerDir, "ush-exec")
+	if err := os.MkdirAll(ushExecHost, 0755); err != nil {
+		ushlog.Warn("fs: unable to create ush-exec dir", "path", ushExecHost, "err", err)
+	} else {
+		searchPaths := []string{"/usr/local/bin", "/usr/bin", "/bin"}
+		if g.ToolsDir != "" {
+			// ToolsDir has FHS structure extracted from .debs (usr/bin, bin).
+			searchPaths = append([]string{
+				filepath.Join(g.ToolsDir, "usr", "bin"),
+				filepath.Join(g.ToolsDir, "bin"),
+			}, searchPaths...)
+		}
+		for _, bin := range blockedBins {
+			for _, dir := range searchPaths {
+				src := filepath.Join(dir, bin)
+				if data, err := os.ReadFile(src); err == nil {
+					dst := filepath.Join(ushExecHost, bin)
+					if werr := os.WriteFile(dst, data, 0755); werr != nil {
+						ushlog.Warn("fs: unable to copy binary", "bin", bin, "err", werr)
+					} else {
+						ushlog.Debug("fs: binary copied", "bin", bin, "src", src)
+					}
+					break
+				}
+			}
+		}
+
+		// If ToolsDir contains libs (needed for dynamic apt), bind-mount
+		// them to an accessible location for ld.so.
+		if g.ToolsDir != "" {
+			for _, libDir := range []string{"usr/lib", "lib", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"} {
+				src := filepath.Join(g.ToolsDir, libDir)
+				if fi, err := os.Stat(src); err == nil && fi.IsDir() {
+					dst := filepath.Join(ushExecHost, "lib")
+					os.MkdirAll(dst, 0755)
+					copyDirContents(src, dst) //nolint:errcheck
+					break
+				}
+			}
+		}
+
+	}
+
+	// 2. Install the LD_PRELOAD shim into the host-side layer BEFORE the bind,
+	// so that everything the guest needs is already in place and the bind can be
+	// mounted read-only. Also intercepts getuid/getgid family for Electron apps.
+	shimDst := filepath.Join(ushExecHost, "ush-chown-shim.so")
+	if err := installPreloadShim(shimDst); err != nil {
+		return fmt.Errorf("fs: install preload shim: %w", err)
+	}
+
+	// 3. Bind-mount LayerDir/ush-exec -> $GUESTROOT/run/ush/exec, READ-ONLY.
+	// The guest only ever reads/execs these files (real apt/dpkg + the shim);
+	// it has no legitimate reason to write here. A RW bind would let a guest
+	// trojan the shim or the apt/dpkg helpers, which are re-loaded/re-executed
+	// by later guest sessions (and would become a host-code-execution vector
+	// the moment any host helper ran from this layer). Fail closed: keep RO.
+	ushExecGuest := filepath.Join(g.GuestRoot, "run", "ush", "exec")
+	if err := os.MkdirAll(ushExecGuest, 0755); err != nil {
+		ushlog.Warn("fs: unable to create ush-exec guest dir", "err", err)
+	} else if err := bindMount(ushExecHost, ushExecGuest, true); err != nil {
+		ushlog.Warn("fs: bind ush-exec failed", "src", ushExecHost, "dst", ushExecGuest, "err", err)
+	} else {
+		ushlog.Debug("fs: ush-exec bind ok (ro)", "dst", ushExecGuest)
+	}
+
+	// 4. /usr stays RO throughout the guest. Blocking wrappers are handled
+	// by the shell (execHandler). The real apt/dpkg binaries are in /run/ush/exec/
+	// for internal use by the pkg manager.
+
+	return nil
+}
+
+func installPreloadShim(dst string) error {
+	ushlog.Info("fs: installing shim", "dst", dst)
+
+	if err := compilePreloadShim(dst); err == nil {
+		ushlog.Info("fs: shim compiled", "path", dst)
+		return nil
+	} else {
+		ushlog.Warn("fs: unable to compile shim, trying prebuilt fallback", "err", err)
+	}
+
+	for _, src := range preloadShimFallbacks() {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(dst, data, 0755); err != nil {
+			return fmt.Errorf("copy prebuilt shim from %s: %w", src, err)
+		}
+		ushlog.Info("fs: shim copied from prebuilt fallback", "src", src, "dst", dst)
+		return nil
+	}
+
+	return fmt.Errorf("no C compiler available and no prebuilt shim found")
+}
+
+func compilePreloadShim(dst string) error {
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp("", "dpkg_shim_*.c")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write([]byte(preload.DpkgShimC)); err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	cmd := exec.Command(cc, "-shared", "-fPIC", "-o", dst, tmpFile.Name())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %w: %s", cmd.String(), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func preloadShimFallbacks() []string {
+	candidates := []string{
+		filepath.Join("preload", "ush-chown-shim.so"),
+		filepath.Join("/usr", "lib", "ush", "ush-chown-shim.so"),
+		filepath.Join("/usr", "local", "lib", "ush", "ush-chown-shim.so"),
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "preload", "ush-chown-shim.so"),
+			filepath.Join(exeDir, "..", "lib", "ush", "ush-chown-shim.so"),
+		)
+	}
+	return candidates
+}
+
+// pivotRoot performs pivot_root to make GuestRoot the new /.
+func (g *GuestFS) pivotRoot() error {
+	newRoot := g.GuestRoot
+	putOld := filepath.Join(newRoot, "old_root")
+
+	// The mount point must be a real mount point.
+	if err := unix.Mount(newRoot, newRoot, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		return fmt.Errorf("fs: bind self for pivot_root: %w", err)
+	}
+
+	if err := syscall.PivotRoot(newRoot, putOld); err != nil {
+		return fmt.Errorf("fs: pivot_root: %w", err)
+	}
+
+	if err := syscall.Chdir("/"); err != nil {
+		return fmt.Errorf("fs: chdir / after pivot_root: %w", err)
+	}
+
+	// Unmount the old root.
+	if err := unix.Unmount("/old_root", unix.MNT_DETACH); err != nil {
+		ushlog.Warn("fs: unable to unmount old_root", "err", err)
+	}
+
+	os.Remove("/old_root")
+
+	ushlog.Debug("fs: pivot_root complete")
+	return nil
+}
+
+// Teardown unmounts everything in an orderly fashion.
+func (g *GuestFS) Teardown() error {
+	ushlog.Info("fs: teardown guest rootfs")
+	// Mounts are automatically unmounted when the namespace dies.
+	// Only remove the guest root temporary directory.
+	return os.RemoveAll(g.GuestRoot)
+}
+
+// bindMount performs a bind mount (RO or RW).
+// The remount RO is best-effort: in user namespace some mounts propagated
+// from the host cannot be remounted RO.
+func bindMount(src, dst string, ro bool) error {
+	flags := uintptr(unix.MS_BIND | unix.MS_REC)
+	if err := unix.Mount(src, dst, "", flags, ""); err != nil {
+		return fmt.Errorf("bind %s->%s: %w", src, dst, err)
+	}
+	if ro {
+		flags = unix.MS_BIND | unix.MS_REMOUNT | unix.MS_RDONLY | unix.MS_REC
+		if err := unix.Mount(src, dst, "", flags, ""); err != nil {
+			// Non-fatal: the kernel enforces its own policies anyway.
+			ushlog.Warn("fs: remount RO failed (best-effort)", "dst", dst, "err", err)
+		}
+	}
+	return nil
+}

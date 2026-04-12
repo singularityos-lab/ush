@@ -292,3 +292,248 @@ func capabilityLabel(cap string) string {
 // host network fallback), 127.0.0.1 is the HOST's loopback: host-local services
 // (sshd, adb, CUPS, ...) are reachable, so loopback must be mediated/denied.
 func (s *Supervisor) SetNetnsIsolated(v bool) { s.netnsIsolated.Store(v) }
+
+// SetEventSink attaches a behavioural telemetry sink. Pass nil to detach.
+// Safe to call once during setup, before heavy traffic.
+func (s *Supervisor) SetEventSink(sink EventSink) { s.sink = sink }
+
+// emit forwards an event to the sink, if one is attached. Nil-safe and, by the
+// EventSink contract, non-blocking.
+func (s *Supervisor) emit(kind guardproto.EventKind, pid uint32, path, dest, detail string) {
+	if s.sink == nil {
+		return
+	}
+	s.sink.EmitGuardEvent(guardproto.Event{
+		Kind:   kind,
+		PID:    pid,
+		Comm:   procName(pid),
+		Path:   path,
+		Dest:   dest,
+		Detail: detail,
+	})
+}
+
+// NewSupervisor creates a Supervisor.
+// If whitelist is nil, all execs are allowed (audit mode).
+// Start in permissive mode; call SetPermissive(false) to enforce.
+func NewSupervisor(notifFd int, whitelist *ExecWhitelist) *Supervisor {
+	s := &Supervisor{
+		notifFd:   notifFd,
+		whitelist: whitelist,
+	}
+	s.permissive.Store(true) // safe default during startup
+	return s
+}
+
+// SetBrokerClient attaches a host-side broker client to the supervisor.
+// When set, sensitive syscalls trigger a permission dialog instead of
+// just being logged. Automatically switches out of permissive mode.
+func (s *Supervisor) SetBrokerClient(c *broker.Client) {
+	s.brokerClient = c
+	if !s.devMode.Load() {
+		s.permissive.Store(false) // broker present: enforce
+	}
+}
+
+// SetDevMode marks the supervisor as serving the developer (dsh) world. It keeps
+// the supervisor audit-only even once the broker is attached.
+func (s *Supervisor) SetDevMode(v bool) {
+	s.devMode.Store(v)
+	if v {
+		s.permissive.Store(true)
+	}
+}
+
+// SetPermissive controls enforcement mode.
+// true = log but allow (audit mode, safe during pkg install / startup).
+// false = enforce whitelist (block unapproved execs).
+func (s *Supervisor) SetPermissive(v bool) {
+	s.permissive.Store(v)
+}
+
+// Run starts the supervisor loop. Blocks until notifFd is closed.
+// Call in a goroutine. Each incoming notification is dispatched to its own
+// goroutine so that a slow broker dialog for one syscall never blocks other
+// concurrent syscalls (e.g. every connect() apt makes would stall otherwise).
+func (s *Supervisor) Run() {
+	ushlog.Info("security: seccomp supervisor started")
+	defer ushlog.Info("security: seccomp supervisor stopped")
+
+	for {
+		var notif seccompNotif
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL,
+			uintptr(s.notifFd), ioctlNotifRecv,
+			uintptr(unsafe.Pointer(&notif)))
+		if errno != 0 {
+			if errno == unix.EINTR {
+				continue
+			}
+			return // fd closed or fatal error
+		}
+
+		// copy it, else every goroutine races on the same loop var
+		n := notif
+		go func() {
+			resp, responded := s.handleNotif(&n)
+			// Built-in socket() injection responds via ADDFD_SEND itself; in
+			// that case we must NOT send a second response.
+			if responded {
+				return
+			}
+			unix.Syscall(unix.SYS_IOCTL,
+				uintptr(s.notifFd), ioctlNotifSend,
+				uintptr(unsafe.Pointer(&resp)))
+		}()
+	}
+}
+
+// Stop closes the notification fd, causing Run to return.
+func (s *Supervisor) Stop() { unix.Close(s.notifFd) }
+
+// handleNotif dispatches a notification. The bool is true when the handler has
+// already responded to the notification itself (ADDFD_SEND path).
+func (s *Supervisor) handleNotif(n *seccompNotif) (seccompNotifResp, bool) {
+	const (
+		sysExecve    = 59
+		sysExecveat  = 322
+		sysSocket    = 41
+		sysConnect   = 42
+		sysOpenat    = 257
+		sysMount     = 165
+		sysChmod     = 90
+		sysFchmod    = 91
+		sysFchmodat  = 268
+		sysFchmodat2 = 452
+	)
+	switch n.Data.Nr {
+	case sysExecve, sysExecveat:
+		return s.handleExecve(n), false
+	case sysSocket:
+		if r, done := s.builtinSocket(n); done {
+			return r, true
+		}
+		return s.handleSocket(n), false
+	case sysConnect:
+		return s.handleConnect(n), false
+	case sysOpenat:
+		return s.handleOpenat(n), false
+	case sysMount:
+		return s.handleMount(n), false
+	case sysChmod, sysFchmod, sysFchmodat, sysFchmodat2:
+		return s.handleChmod(n), false
+	}
+	return seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}, false
+}
+
+// builtinSocket, in built-in networking mode, creates the inet TCP/UDP socket
+// in the HOST net namespace and injects it into the guest, so the guest's
+// "socket" is actually wired to the host network from birth (the guest netns
+// has only loopback). The returned bool is true when it handled+responded.
+// Non-inet / raw / non-builtin cases return false and fall through to the
+// normal handleSocket policy.
+func (s *Supervisor) builtinSocket(n *seccompNotif) (seccompNotifResp, bool) {
+	if !s.builtinNet.Load() {
+		return seccompNotifResp{}, false
+	}
+	domain := int(int32(n.Data.Args[0]))
+	rawType := int(int32(n.Data.Args[1]))
+	sockType := rawType & 0xf
+	proto := int(int32(n.Data.Args[2]))
+	if domain != unix.AF_INET && domain != unix.AF_INET6 {
+		return seccompNotifResp{}, false
+	}
+	if sockType != unix.SOCK_STREAM && sockType != unix.SOCK_DGRAM {
+		return seccompNotifResp{}, false // raw etc. -> normal gating
+	}
+
+	denied := func() (seccompNotifResp, bool) {
+		// Respond with EPERM via a normal response (not SEND).
+		unix.Syscall(unix.SYS_IOCTL, uintptr(s.notifFd), ioctlNotifSend,
+			uintptr(unsafe.Pointer(&seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)})))
+		return seccompNotifResp{}, true
+	}
+
+	hostFd, err := unix.Socket(domain, rawType, proto)
+	if err != nil {
+		return denied()
+	}
+	// Inject a dup into the guest and drop our own copy: connect() later reaches
+	// the guest's fd via pidfd_getfd, so nothing needs to be retained (no leak).
+	_, err = s.injectFdSend(n.ID, hostFd)
+	unix.Close(hostFd)
+	if err != nil {
+		return denied()
+	}
+	return seccompNotifResp{}, true
+}
+
+// injectFdSend installs srcfd into the target and atomically responds to the
+// notification, returning the new fd number as the intercepted syscall result.
+func (s *Supervisor) injectFdSend(id uint64, srcfd int) (int, error) {
+	const seccompAddfdFlagSend = 2
+	a := seccompNotifAddfd{ID: id, Flags: seccompAddfdFlagSend, Srcfd: uint32(srcfd)}
+	r, _, errno := unix.Syscall(unix.SYS_IOCTL,
+		uintptr(s.notifFd), ioctlNotifAddfd, uintptr(unsafe.Pointer(&a)))
+	if errno != 0 {
+		return -1, errno
+	}
+	return int(r), nil
+}
+
+// handleExecve audits/enforces the exec whitelist.
+// All path resolution uses /proc/<pid>/root/ so the host-side hash matches
+// the file the child would actually execute.
+func (s *Supervisor) handleExecve(n *seccompNotif) seccompNotifResp {
+	allowResp := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
+	denyResp := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+
+	// Fail closed when enforcing the whitelist: if we cannot read the path we
+	// cannot validate it, and an attacker can deliberately make the read fail
+	// (e.g. argv[0] straddling an unmapped page) to slip past the check.
+	enforcing := s.whitelist != nil && !s.permissive.Load()
+
+	guestPath, err := readStringFromProcess(int(n.PID), uintptr(n.Data.Args[0]))
+	if err != nil {
+		ushlog.Debug("security: execve: cannot read path from child mem",
+			"pid", n.PID, "err", err)
+		if enforcing {
+			ushlog.Warn("security: exec denied (unreadable path, failing closed)", "pid", n.PID)
+			return denyResp
+		}
+		return allowResp
+	}
+
+	// /proc/<pid>/root/<guestPath> resolves through the child's mount namespace.
+	hostPath := filepath.Join(fmt.Sprintf("/proc/%d/root", n.PID), guestPath)
+
+	// Behavioural telemetry: every exec is interesting to the correlator.
+	s.emit(guardproto.EventExec, n.PID, guestPath, "", "")
+
+	if s.whitelist == nil {
+		ushlog.Debug("security: exec (no whitelist)", "path", guestPath)
+		return allowResp
+	}
+
+	allowed := s.whitelist.Allow(hostPath, guestPath)
+	if !allowed {
+		if s.permissive.Load() {
+			ushlog.Debug("security: exec audit-deny (permissive, allowed)",
+				"path", guestPath, "pid", n.PID)
+			return allowResp
+		}
+		ushlog.Warn("security: exec blocked (not in whitelist)",
+			"path", guestPath, "pid", n.PID)
+		return denyResp
+	}
+
+	// Re-validate the notification before continuing. If it went stale between
+	// the read and now, the validated path may no longer be what the kernel
+	// will execute; fail closed when enforcing.
+	if enforcing && !s.notifIDValid(n.ID) {
+		ushlog.Warn("security: exec denied (notification went stale)", "path", guestPath, "pid", n.PID)
+		return denyResp
+	}
+
+	ushlog.Debug("security: exec allowed", "path", guestPath, "pid", n.PID)
+	return allowResp
+}

@@ -1057,3 +1057,219 @@ func normHome(p string) string {
 	}
 	return p
 }
+
+// pathHasPrefix reports whether path is at or below one of the prefixes, after
+// normalizing the /var/home alias on both sides.
+func pathHasPrefix(path string, prefixes []string) bool {
+	path = normHome(path)
+	for _, pre := range prefixes {
+		if pre == "" {
+			continue
+		}
+		pre = normHome(pre)
+		if path == pre || strings.HasPrefix(path, pre+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// procName returns the short command name of pid read from /proc/<pid>/comm.
+// Returns "unknown" if the file cannot be read.
+//
+// NOTE: comm is attacker-controlled (prctl(PR_SET_NAME)), so it is used only
+// for human-facing telemetry and dialog text, NEVER for a trust decision.
+// Use procExe for identity.
+func procName(pid uint32) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// procExe returns the absolute path of the executable backing pid, read from
+// the kernel-maintained /proc/<pid>/exe symlink. Unlike comm, a process cannot
+// forge this: it is set by the kernel at execve time. The path is resolved in
+// the target's mount namespace, so it matches the guest-visible path. Returns
+// "" if it cannot be resolved (caller must then treat the app as untrusted).
+func procExe(pid uint32) string {
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return ""
+	}
+	// A deleted executable readlinks as "<path> (deleted)"; never trust those.
+	if strings.HasSuffix(target, " (deleted)") {
+		return ""
+	}
+	return target
+}
+
+// isAppTrusted checks if the process making a request belongs to an app the
+// user has blanket-trusted via "perm trust <app>". Trust is keyed on the real
+// executable path (procExe), which the guest cannot spoof, instead of the
+// freely-settable comm name.
+func (s *Supervisor) isAppTrusted(pid uint32) bool {
+	if s.brokerClient == nil {
+		return false
+	}
+	exe := procExe(pid)
+	if exe == "" {
+		return false
+	}
+	return s.brokerClient.IsAppTrusted(exe)
+}
+
+// readBytesFromProcess reads n bytes from a process's virtual memory at addr.
+func readBytesFromProcess(pid int, addr uintptr, n int) ([]byte, error) {
+	memPath := fmt.Sprintf("/proc/%d/mem", pid)
+	f, err := os.Open(memPath)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", memPath, err)
+	}
+	defer f.Close()
+
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, int64(addr)); err != nil {
+		return nil, fmt.Errorf("read mem at %x: %w", addr, err)
+	}
+	return buf, nil
+}
+
+// readStringFromProcess reads a null-terminated string from another process's
+// virtual memory via /proc/<pid>/mem (requires parent-child relationship).
+// Fails if /proc/<pid>/mem is inaccessible (YAMA ptrace_scope > 1, dumpable=0).
+func readStringFromProcess(pid int, addr uintptr) (string, error) {
+	memPath := fmt.Sprintf("/proc/%d/mem", pid)
+	f, err := os.Open(memPath)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", memPath, err)
+	}
+	defer f.Close()
+
+	var buf [4096]byte
+	n, err := f.ReadAt(buf[:], int64(addr))
+	if err != nil && n == 0 {
+		return "", fmt.Errorf("read mem at %x: %w", addr, err)
+	}
+	for i := 0; i < n; i++ {
+		if buf[i] == 0 {
+			return string(buf[:i]), nil
+		}
+	}
+	return string(buf[:n]), nil
+}
+
+// NotifSocketName returns the Unix socket name for seccomp fd transfer.
+// It is placed in the XDG_RUNTIME_DIR which is bind-mounted from host into guest,
+// making the same path accessible from both parent (host) and child (guest).
+func NotifSocketName(xdgRuntime, sessionID string) string {
+	// Placed in the "ush" subdir of XDG_RUNTIME_DIR: ush bind-mounts ONLY that
+	// subdir into the guest (never the whole runtime dir, which would expose the
+	// host session bus), so both sides share this path.
+	return filepath.Join(xdgRuntime, "ush", "ush-seccomp-"+sessionID+".sock")
+}
+
+// SendNotifFd sends the seccomp notification fd to the parent supervisor
+// using SCM_RIGHTS over the socket at socketPath.
+// Called from the child process after InstallSeccompNotifyFilter.
+func SendNotifFd(notifFd int, socketPath string) error {
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return fmt.Errorf("security: dial notif socket %s: %w", socketPath, err)
+	}
+	defer conn.Close()
+
+	uc := conn.(*net.UnixConn)
+	rights := syscall.UnixRights(notifFd)
+	_, _, err = uc.WriteMsgUnix([]byte{0}, rights, nil)
+	return err
+}
+
+// DialNotifSocket opens a connection to the supervisor socket without
+// sending anything yet. Must be called BEFORE installing the seccomp-notify
+// filter so the connect() syscall is not itself intercepted.
+func DialNotifSocket(socketPath string) (*net.UnixConn, error) {
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("security: dial notif socket %s: %w", socketPath, err)
+	}
+	return conn.(*net.UnixConn), nil
+}
+
+// SendNotifFdOverConn sends the seccomp notification fd over an already-open
+// Unix connection using SCM_RIGHTS. Use this after DialNotifSocket + filter install.
+func SendNotifFdOverConn(notifFd int, conn *net.UnixConn) error {
+	defer conn.Close()
+	rights := syscall.UnixRights(notifFd)
+	_, _, err := conn.WriteMsgUnix([]byte{0}, rights, nil)
+	return err
+}
+
+// RecvNotifFd listens on socketPath for an incoming SCM_RIGHTS message
+// containing the seccomp notification fd. Sets O_CLOEXEC on the received fd
+// so it is not accidentally inherited by broker helper processes (zenity, etc.).
+// Called from the parent before the child installs the filter.
+func RecvNotifFd(socketPath string) (int, error) {
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0700); err != nil {
+		return 0, fmt.Errorf("security: mkdir notif socket dir: %w", err)
+	}
+	os.Remove(socketPath)
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return 0, fmt.Errorf("security: listen %s: %w", socketPath, err)
+	}
+	defer ln.Close()
+	defer os.Remove(socketPath)
+
+	conn, err := ln.Accept()
+	if err != nil {
+		return 0, fmt.Errorf("security: accept: %w", err)
+	}
+	defer conn.Close()
+
+	uc := conn.(*net.UnixConn)
+	buf := make([]byte, 1)
+	oob := make([]byte, syscall.CmsgSpace(4))
+	_, oobn, _, _, err := uc.ReadMsgUnix(buf, oob)
+	if err != nil {
+		return 0, fmt.Errorf("security: recv scm_rights: %w", err)
+	}
+
+	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil || len(msgs) == 0 {
+		return 0, fmt.Errorf("security: parse scm: %w", err)
+	}
+
+	fds, err := syscall.ParseUnixRights(&msgs[0])
+	if err != nil || len(fds) == 0 {
+		return 0, fmt.Errorf("security: parse fds: %w", err)
+	}
+
+	notifFd := fds[0]
+	// Set O_CLOEXEC to prevent the fd from leaking to broker helper processes.
+	if err := unix.SetNonblock(notifFd, false); err == nil {
+		unix.FcntlInt(uintptr(notifFd), syscall.F_SETFD, syscall.FD_CLOEXEC)
+	}
+	return notifFd, nil
+}
+
+// SkippedRootPaths are paths excluded from the startup whitelist walk.
+// These are either user-controlled (writable) or contain trusted helper binaries
+// that must not be directly exec-able by guest processes.
+var SkippedRootPaths = []string{
+	"/home", "/tmp", "/run", "/proc", "/sys", "/dev",
+	"/run/ush/exec", // real apt/dpkg helpers - must not be in whitelist
+}
+
+// ShouldSkipForWhitelist returns true if path should be excluded from the
+// startup whitelist walk.
+func ShouldSkipForWhitelist(path string) bool {
+	for _, skip := range SkippedRootPaths {
+		if path == skip || strings.HasPrefix(path, skip+"/") {
+			return true
+		}
+	}
+	return false
+}

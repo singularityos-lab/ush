@@ -480,3 +480,171 @@ func (s *Server) denyApp(appName string) error {
 	ushlog.Info("broker: app untrusted", "app", appName)
 	return nil
 }
+
+// isAppTrusted checks if an app has been granted blanket permission.
+func (s *Server) isAppTrusted(appName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	appKey := "app:" + appName
+	decision, ok := s.policy.Check(policy.Category(appKey), "*")
+	return ok && decision == policy.DecisionAllow
+}
+
+// devDirCategory is the policy category under which trusted developer
+// directories are stored. A trusted dir gets full host access from the guest
+// (executables and VCS hooks run on the host), so the grant always requires
+// explicit host-side confirmation, exactly like app trust.
+const devDirCategory policy.Category = "devdir"
+
+// trustDir grants a directory full host access from the guest, AFTER a host-side
+// confirmation. This is the path used by the guest shell's `perm trust-dir`,
+// where the requester is the untrusted guest and the dialog is the security gate.
+func (s *Server) trustDir(path string) error {
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	if !s.confirmDialog(
+		"USH - Trust developer directory",
+		fmt.Sprintf("Give the sandbox FULL host access to this directory?\n\n%s\n\n"+
+			"Executables and git hooks the sandbox writes here will be able to run "+
+			"on your host. Only do this for directories you actively develop in.",
+			dialogSafe(path)),
+	) {
+		ushlog.Warn("broker: dir trust denied by user", "path", path)
+		return fmt.Errorf("trust not confirmed by user")
+	}
+	return s.trustDirConfirmed(path)
+}
+
+// trustDirConfirmed persists a directory trust WITHOUT a confirmation dialog. It
+// is only reachable from the HOST-ONLY management D-Bus interface (the desktop
+// file manager's "Share with Linux"): that caller is already a trusted host UI
+// and the guest cannot reach the session bus, so the host UI gesture IS the
+// consent. The guest socket path never calls this; it goes through trustDir.
+func (s *Server) trustDirConfirmed(path string) error {
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	s.mu.Lock()
+	s.policy.Set(devDirCategory, path, policy.DecisionAllow)
+	err := s.policy.Save()
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	ushlog.Info("broker: developer directory trusted", "path", path)
+
+	// Apply it live to any running guest: the mount helper attaches the folder
+	// without a restart. Best-effort; if no helper answers, `restart` applies it.
+	mounthelper.Notify(runtimeDir(), path)
+	return nil
+}
+
+// runtimeDir returns $XDG_RUNTIME_DIR (or the conventional fallback) where the
+// per-session mount-helper sockets live.
+func runtimeDir() string {
+	if rt := os.Getenv("XDG_RUNTIME_DIR"); rt != "" {
+		return rt
+	}
+	return filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
+}
+
+// requestDevShell asks the user, host-side, to open the developer environment
+// (dsh). The guest can call it but cannot answer it: the dialog is the gate that
+// stops sandboxed code from escalating itself into the unlocked dev world.
+func (s *Server) requestDevShell() bool {
+	// Policy gate first: a guest may ask, but the image/managed policy and the
+	// user opt-in decide. The guest cannot forge either (the image policy is in
+	// the immutable rootfs; the opt-in marker is in the host-owned storage dir).
+	if devpolicy.Evaluate(s.storageDir) != devpolicy.Allow {
+		ushlog.Info("broker: dev shell request refused by policy")
+		return false
+	}
+	return s.confirmDialog(
+		"USH - Open developer environment",
+		"Open the developer environment (dsh)?\n\n"+
+			"It unlocks containers (podman/distrobox), builds and an open network. "+
+			"It is NOT a security sandbox: code you run there has a real developer "+
+			"machine on your account.")
+}
+
+// devShellStatus reports the image policy and whether dsh is enabled now, for
+// the desktop "Development" page (it hides the toggle when not permitted).
+func (s *Server) devShellStatus() (policy string, enabled bool) {
+	return devpolicy.Status(s.storageDir)
+}
+
+// setDevShellEnabled flips the user opt-in. Refused if the image policy forbids
+// dsh, so the desktop cannot bypass a managed image.
+func (s *Server) setDevShellEnabled(on bool) error {
+	return devpolicy.SetUserEnabled(s.storageDir, on)
+}
+
+// isDirTrusted reports whether path is at or below a trusted developer directory.
+func (s *Server) isDirTrusted(path string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path = strings.TrimRight(path, "/")
+	for _, r := range s.policy.List() {
+		if r.Category != devDirCategory || r.Decision != policy.DecisionAllow {
+			continue
+		}
+		d := strings.TrimRight(r.Resource, "/")
+		if path == d || strings.HasPrefix(path, d+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// untrustDir revokes a directory's trust.
+func (s *Server) untrustDir(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policy.Remove(devDirCategory, path)
+	if err := s.policy.Save(); err != nil {
+		return err
+	}
+	ushlog.Info("broker: developer directory untrusted", "path", path)
+	return nil
+}
+
+// listDevDirs returns the trusted developer directories as a JSON array.
+func (s *Server) listDevDirs() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var dirs []string
+	for _, r := range s.policy.List() {
+		if r.Category == devDirCategory && r.Decision == policy.DecisionAllow {
+			dirs = append(dirs, r.Resource)
+		}
+	}
+	data, _ := json.Marshal(dirs)
+	return string(data)
+}
+
+// dialogSafe sanitizes a guest-controlled string before it is rendered in a
+// host-side dialog or terminal. The guest fully controls category/resource/
+// reason/app over the control socket; without this a value like
+// "harmless\n\nClick Grant to continue" (or a raw ANSI escape such as \033[2J)
+// could forge the dialog text to socially engineer a grant, or corrupt the host
+// terminal. Strips every ASCII control character (newlines, tabs, ESC, NUL) and
+// caps the length so dialog text is a single, bounded, inert line. Policy keys
+// keep the raw value; only the rendered copy is sanitized.
+func dialogSafe(in string) string {
+	const max = 256
+	var b strings.Builder
+	for _, r := range in {
+		if r < 0x20 || r == 0x7f {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > max {
+		out = out[:max] + "..."
+	}
+	return out
+}

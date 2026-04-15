@@ -648,3 +648,266 @@ func dialogSafe(in string) string {
 	}
 	return out
 }
+
+// showDialog shows the permission request dialog to the user.
+// Tries the ush Portal D-Bus interface first (native DE integration),
+// then falls back to zenity, kdialog, or terminal prompt.
+func (s *Server) showDialog(category, resource, reason string) string {
+	// Non-interactive mode: decide from the scripted policy and skip all GUIs.
+	// Uses the raw values so scripted rule matching stays exact.
+	if s.auto != nil && s.auto.enabled {
+		return s.auto.decide(category, resource, reason)
+	}
+
+	// Everything below is user-facing: sanitize the guest-controlled strings so
+	// they cannot forge the dialog body or inject terminal escapes.
+	category = dialogSafe(category)
+	resource = dialogSafe(resource)
+	reason = dialogSafe(reason)
+
+	if decision := s.portalDialog(category, resource, reason); decision != "" {
+		return decision
+	}
+
+	msg := fmt.Sprintf(
+		"USH - Permission request\n\nCategory: %s\nResource: %s",
+		category, resource,
+	)
+	if reason != "" {
+		msg += "\n\nReason: " + reason
+	}
+
+	if _, err := exec.LookPath("zenity"); err == nil {
+		return s.zenityDialog(msg)
+	}
+
+	if _, err := exec.LookPath("kdialog"); err == nil {
+		return s.kdialogDialog(msg)
+	}
+
+	return s.terminalDialog(category, resource, reason)
+}
+
+// confirmDialog asks the user a yes/no question and returns true only on an
+// explicit affirmative answer. Everything else (cancel, error, no dialog tool,
+// EOF on the terminal) is treated as "no" so the default is always safe. Used
+// to gate privileged broker operations that the sandboxed guest can invoke.
+func (s *Server) confirmDialog(title, msg string) bool {
+	// Non-interactive mode: answer from the scripted confirm verdict.
+	if s.auto != nil && s.auto.enabled {
+		return s.auto.confirmVerdict("confirm", title)
+	}
+
+	// Prefer the desktop portal (native dialog), fall back to zenity/kdialog/term
+	// when it is absent (headless/CI).
+	if ok, served := s.portalConfirm(title, msg); served {
+		return ok
+	}
+
+	if _, err := exec.LookPath("zenity"); err == nil {
+		err := exec.Command("zenity", "--question",
+			"--title="+title, "--text="+msg,
+			"--ok-label=Grant", "--cancel-label=Deny",
+			"--width=500").Run()
+		return err == nil // zenity exits 0 only when the user confirms
+	}
+	if _, err := exec.LookPath("kdialog"); err == nil {
+		err := exec.Command("kdialog", "--title", title, "--yesno", msg).Run()
+		return err == nil
+	}
+
+	fmt.Printf("\n\033[1;33m[USH broker]\033[0m %s\n%s\n", title, msg)
+	fmt.Printf("Type 'yes' to confirm: ")
+	var answer string
+	fmt.Scanln(&answer)
+	return strings.EqualFold(strings.TrimSpace(answer), "yes")
+}
+
+// portalConfirm asks the desktop portal to render a yes/no confirmation via
+// io.github.singularityos_lab.ush.Portal1.ShowConfirm. served is false when the portal
+// is unavailable, so the caller falls back to zenity/kdialog/terminal.
+func (s *Server) portalConfirm(title, body string) (result bool, served bool) {
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		return false, false
+	}
+	defer conn.Close()
+	obj := conn.Object(PortalBusName, dbus.ObjectPath(PortalObjPath))
+	call := obj.Call(PortalInterface+".ShowConfirm", 0, title, body)
+	if call.Err != nil {
+		return false, false
+	}
+	if err := call.Store(&result); err != nil {
+		return false, false
+	}
+	return result, true
+}
+
+// portalDialog calls the ush Portal D-Bus interface.
+// A DE that implements io.github.singularityos_lab.ush.Portal1 can show
+// a native permission dialog. Returns empty string if the portal
+// is unavailable or the call fails (fallback path).
+func (s *Server) portalDialog(category, resource, reason string) string {
+	conn, err := dbus.ConnectSessionBus()
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	obj := conn.Object(PortalBusName, dbus.ObjectPath(PortalObjPath))
+	var decision string
+	call := obj.Call(PortalInterface+".ShowPermission", 0,
+		category, resource, reason,
+	)
+	if err := call.Store(&decision); err != nil {
+		return ""
+	}
+
+	switch decision {
+	case "allow", "allow_session", "allow_always", "deny":
+		return decision
+	default:
+		return ""
+	}
+}
+
+func (s *Server) zenityDialog(msg string) string {
+	args := []string{"--list",
+		"--title=USH - Permission request",
+		"--text=" + msg,
+		"--column=Choice",
+		"--column=Description",
+		"allow", "Allow this time",
+		"allow_session", "Allow for this session",
+		"allow_always", "Always allow this resource",
+		"deny", "Deny",
+		"--width=500", "--height=350",
+	}
+
+	cmd := exec.Command("zenity", args...)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "deny"
+	}
+
+	choice := strings.TrimSpace(string(out))
+	if choice == "" {
+		return "deny"
+	}
+	return choice
+}
+
+func (s *Server) kdialogDialog(msg string) string {
+	choices := "allow:Allow this time|allow_session:Allow for session|allow_always:Always allow this resource|deny:Deny"
+	cmd := exec.Command("kdialog", "--menu", msg, choices)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return "deny"
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (s *Server) terminalDialog(category, resource, reason string) string {
+	fmt.Printf("\n\033[1;33m[USH broker]\033[0m Permission request\n")
+	fmt.Printf("  Category: %s\n", category)
+	fmt.Printf("  Resource: %s\n", resource)
+	if reason != "" {
+		fmt.Printf("  Reason:   %s\n", reason)
+	}
+	fmt.Printf("\n  [1] Allow this time\n")
+	fmt.Printf("  [2] Allow for this session\n")
+	fmt.Printf("  [3] Always allow this resource\n")
+	fmt.Printf("  [4] Deny (default)\n")
+	fmt.Printf("\nChoice: ")
+
+	var choice string
+	fmt.Scanln(&choice)
+
+	switch strings.TrimSpace(choice) {
+	case "1":
+		return "allow"
+	case "2":
+		return "allow_session"
+	case "3":
+		return "allow_always"
+	default:
+		return "deny"
+	}
+}
+
+// AuditLog manages the broker audit log.
+type AuditLog struct {
+	dir  string
+	mu   sync.Mutex
+	file *os.File
+	date string // YYYY-MM-DD of the currently open file, for rotation
+}
+
+// AuditEntry is a record in the audit log.
+type AuditEntry struct {
+	Timestamp time.Time `json:"ts"`
+	SessionID string    `json:"session"`
+	Category  string    `json:"category"`
+	Resource  string    `json:"resource"`
+	Scope     string    `json:"scope,omitempty"`
+	Decision  string    `json:"decision"`
+	Source    string    `json:"source"`
+	Reason    string    `json:"reason,omitempty"`
+}
+
+// NewAuditLog creates a new audit log.
+func NewAuditLog(dir string) (*AuditLog, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	a := &AuditLog{dir: dir}
+	if err := a.openFile(); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (a *AuditLog) openFile() error {
+	date := time.Now().Format("2006-01-02")
+	path := filepath.Join(a.dir, date+".jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	a.file = f
+	a.date = date
+	return nil
+}
+
+// Write writes a record to the log, rotating to a new dated file when the day
+// changes so a long-running broker does not keep appending to the first day.
+func (a *AuditLog) Write(entry AuditEntry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if today := time.Now().Format("2006-01-02"); today != a.date {
+		if a.file != nil {
+			a.file.Close()
+		}
+		if err := a.openFile(); err != nil {
+			return
+		}
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	a.file.Write(append(data, '\n'))
+}
+
+// Close closes the log.
+func (a *AuditLog) Close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file != nil {
+		a.file.Close()
+	}
+}

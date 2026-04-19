@@ -911,4 +911,3 @@ func (a *AuditLog) Close() {
 		a.file.Close()
 	}
 }
-

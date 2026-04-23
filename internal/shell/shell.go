@@ -553,3 +553,271 @@ func (sh *Shell) builtinDsh(ctx context.Context) error {
 	fmt.Fprintln(hc.Stdout, "Entering developer shell (dsh)...")
 	return errShellRestart
 }
+
+// resolveDirArg turns a user-supplied directory argument (empty means the current
+// working directory) into a cleaned absolute path.
+func resolveDirArg(dir string) (string, error) {
+	if dir == "" {
+		return os.Getwd()
+	}
+	if !filepath.IsAbs(dir) {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(cwd, dir)
+	}
+	return filepath.Clean(dir), nil
+}
+
+func resolveAppExe(name string) (string, error) {
+	var p string
+	if strings.ContainsRune(name, '/') {
+		p = name
+	} else {
+		found, err := exec.LookPath(name)
+		if err != nil {
+			return "", fmt.Errorf("%q not found on PATH (give a full path)", name)
+		}
+		p = found
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	return abs, nil
+}
+
+// builtinRun launches an app inside a per-app execution sandbox (jail): a fresh
+// mount namespace with the system tree read-only, a private home and /tmp, and
+// only the host paths the app's profile grants. Default-deny: an unprofiled app
+// sees nothing of the guest home (other apps' data, credentials).
+//
+// Profiles live at ~/.config/ush/apps/<name>.json. The persistent per-app home
+// is ~/.ush-apps/<name>, inside the (already isolated) guest home.
+func (sh *Shell) builtinRun(ctx context.Context, args []string) error {
+	hc := interp.HandlerCtx(ctx)
+	if len(args) == 0 {
+		fmt.Fprintln(hc.Stderr, "usage: run <app> [args...]   (per-app sandbox; profile in ~/.config/ush/apps/<app>.json)")
+		return interp.NewExitStatus(2)
+	}
+
+	appPath, err := exec.LookPath(args[0])
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "run: %s: executable not found\n", args[0])
+		return interp.NewExitStatus(127)
+	}
+	name := filepath.Base(args[0])
+	profJSON := loadJailProfile(name)
+
+	home := os.Getenv("HOME")
+	appHome := filepath.Join(home, ".ush-apps", name)
+	_ = os.MkdirAll(appHome, 0700)
+
+	// /proc/self/exe always resolves to the running ush binary, even after the
+	// guest pivot_root (os.Executable() would return the now-invalid host path).
+	cmdArgs := append([]string{jail.Sentinel, appPath}, args[1:]...)
+	c := exec.CommandContext(ctx, "/proc/self/exe", cmdArgs...)
+	c.Env = append(os.Environ(),
+		jail.EnvProfile+"="+profJSON,
+		jail.EnvAppHome+"="+appHome,
+	)
+	c.Stdin = hc.Stdin
+	c.Stdout = hc.Stdout
+	c.Stderr = hc.Stderr
+	// A fresh mount namespace for the jail; pivot_root happens inside it.
+	c.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+
+	if err := c.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return interp.NewExitStatus(uint8(ee.ExitCode()))
+		}
+		fmt.Fprintf(hc.Stderr, "run: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	return nil
+}
+
+// loadJailProfile returns the JSON profile for an app, or a minimal default
+// (default-deny: no extra grants) when none is configured.
+func loadJailProfile(name string) string {
+	path := filepath.Join(os.Getenv("HOME"), ".config", "ush", "apps", name+".json")
+	if data, err := os.ReadFile(path); err == nil {
+		var probe map[string]interface{}
+		if json.Unmarshal(data, &probe) == nil {
+			return string(data)
+		}
+	}
+	return `{"name":"` + name + `"}`
+}
+
+// builtinPerm handles the 'perm' builtin: requests a permission via the broker.
+// Usage: perm <category> <resource> [reason]
+func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
+	hc := interp.HandlerCtx(ctx)
+
+	if len(args) == 0 {
+		fmt.Fprintln(hc.Stderr, "usage: perm <category> <resource> [reason]")
+		fmt.Fprintln(hc.Stderr, "       perm trust <app>        (allow all permissions for app)")
+		fmt.Fprintln(hc.Stderr, "       perm untrust <app>      (revoke blanket permission for app)")
+		fmt.Fprintln(hc.Stderr, "       perm trust-dir [path]   (full host access for a dev dir: build/run/git)")
+		fmt.Fprintln(hc.Stderr, "       perm untrust-dir [path] (revoke a dev dir's trust)")
+		fmt.Fprintln(hc.Stderr, "       perm list-dirs          (list trusted dev dirs)")
+		fmt.Fprintln(hc.Stderr, "  categories: network, filesystem, device, service")
+		return interp.NewExitStatus(1)
+	}
+
+	if !broker.IsAvailable() {
+		fmt.Fprintln(hc.Stderr, "perm: broker not available (USH-broker not running?)")
+		return interp.NewExitStatus(1)
+	}
+
+	client, err := broker.NewClient(sh.sessionID)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "perm: broker connect: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	defer client.Close()
+
+	// perm trust <app>
+	if args[0] == "trust" {
+		if len(args) < 2 {
+			fmt.Fprintln(hc.Stderr, "perm trust: specify an application name or path")
+			return interp.NewExitStatus(1)
+		}
+		exe, err := resolveAppExe(args[1])
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "perm trust: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		if err := client.AllowApp(exe); err != nil {
+			fmt.Fprintf(hc.Stderr, "perm trust: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		fmt.Fprintf(hc.Stdout, "perm: %s is now trusted (all permissions allowed)\n", exe)
+		return nil
+	}
+
+	// perm untrust <app>
+	if args[0] == "untrust" {
+		if len(args) < 2 {
+			fmt.Fprintln(hc.Stderr, "perm untrust: specify an application name or path")
+			return interp.NewExitStatus(1)
+		}
+		exe, err := resolveAppExe(args[1])
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "perm untrust: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		if err := client.DenyApp(exe); err != nil {
+			fmt.Fprintf(hc.Stderr, "perm untrust: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		fmt.Fprintf(hc.Stdout, "perm: %s is no longer trusted\n", exe)
+		return nil
+	}
+
+	// perm trust-dir [path] / perm untrust-dir [path]
+	if args[0] == "trust-dir" || args[0] == "untrust-dir" {
+		dir := ""
+		if len(args) >= 2 {
+			dir = args[1]
+		}
+		abs, err := resolveDirArg(dir)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "perm %s: %v\n", args[0], err)
+			return interp.NewExitStatus(1)
+		}
+		if args[0] == "trust-dir" {
+			if err := client.TrustDir(abs); err != nil {
+				fmt.Fprintf(hc.Stderr, "perm trust-dir: %v\n", err)
+				return interp.NewExitStatus(1)
+			}
+			fmt.Fprintf(hc.Stdout, "perm: %s is now a trusted dev dir (full host access: build, run, git).\n", abs)
+			fmt.Fprintln(hc.Stdout, "      Applied live to this session - cd into it. (If it doesn't update, run 'restart'.)")
+			return nil
+		}
+		if err := client.UntrustDir(abs); err != nil {
+			fmt.Fprintf(hc.Stderr, "perm untrust-dir: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		fmt.Fprintf(hc.Stdout, "perm: %s is no longer a trusted dev dir. Restart ush to apply.\n", abs)
+		return nil
+	}
+
+	// perm list-dirs
+	if args[0] == "list-dirs" {
+		fmt.Fprintln(hc.Stdout, client.ListDevDirs())
+		return nil
+	}
+
+	if len(args) < 2 {
+		fmt.Fprintln(hc.Stderr, "usage: perm <category> <resource> [reason]")
+		return interp.NewExitStatus(1)
+	}
+
+	category := args[0]
+	resource := args[1]
+	reason := ""
+	if len(args) >= 3 {
+		reason = strings.Join(args[2:], " ")
+	}
+
+	decision, err := client.RequestPermission(category, resource, reason)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "perm: request failed: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+
+	fmt.Fprintf(hc.Stdout, "perm: decision=%s\n", decision)
+
+	if decision == broker.DecisionDeny {
+		return interp.NewExitStatus(1)
+	}
+	return nil
+}
+
+// pkgFix implements 'pkg fix [--broken]'.
+func (sh *Shell) pkgFix(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	broken := false
+	for _, a := range args {
+		if a == "--broken" || a == "-b" {
+			broken = true
+		}
+	}
+
+	if broken {
+		return sh.pkgMgr.FixBroken(ctx, hc.Stdout, hc.Stderr)
+	}
+	return sh.pkgMgr.Fix(ctx, hc.Stdout, hc.Stderr)
+}
+
+func printPkgUsage(w io.Writer) {
+	fmt.Fprint(w, `pkg - USH package runtime
+
+USAGE:
+  pkg install [--one-time] <package...>   install package(s)
+  pkg remove <package...>                 remove package(s) from layer
+  pkg fix [--broken]                      repair broken dpkg state / dependencies
+  pkg burn <package...>                   destroy package layer
+  pkg diff                                show delta from base system
+  pkg inspect <package>                   show files, scripts, units, side effects
+  pkg freeze                              promote ephemeral layer to persistent
+  pkg list                                list installed packages
+  pkg compat [<package>]                  check package compatibility with USH
+`)
+}
+
+// completeBuiltinCmds completes ush builtin commands (pkg, perm).
+func completeBuiltinCmds(prefix string) []string {
+	var matches []string
+	for _, cmd := range []string{"pkg", "perm", "scan", "guard", "quarantine"} {
+		if strings.HasPrefix(cmd, prefix) {
+			matches = append(matches, cmd)
+		}
+	}
+	return matches
+}

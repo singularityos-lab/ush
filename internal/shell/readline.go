@@ -330,3 +330,58 @@ func visibleLen(s string) int {
 	}
 	return n
 }
+
+// moveCursor moves the cursor without redrawing.
+func (rl *Readline) moveCursor(prompt string, buf []rune, pos int) {
+	rl.redrawLine(prompt, buf, pos)
+}
+
+// readLineSimple reads a simple line (non-interactive).
+func (rl *Readline) readLineSimple(prompt string) (string, error) {
+	fmt.Fprint(os.Stdout, prompt)
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Scan() {
+		return scanner.Text(), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", io.EOF
+}
+
+// addHistory adds an entry to history (deduplicating consecutive entries).
+func (rl *Readline) addHistory(line string) {
+	if len(rl.history) > 0 && rl.history[len(rl.history)-1] == line {
+		return
+	}
+	rl.history = append(rl.history, line)
+	// Keep at most 5000 entries.
+	if len(rl.history) > 5000 {
+		rl.history = rl.history[len(rl.history)-5000:]
+	}
+	rl.histIdx = len(rl.history)
+}
+
+// loadHistory loads history from the file.
+func (rl *Readline) loadHistory() {
+	data, err := os.ReadFile(rl.histFile)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, l := range lines {
+		if l != "" {
+			rl.history = append(rl.history, l)
+		}
+	}
+}
+
+// saveHistory saves history to the file.
+func (rl *Readline) saveHistory() {
+	os.MkdirAll(strings.TrimSuffix(rl.histFile, "/"+strings.Split(rl.histFile, "/")[len(strings.Split(rl.histFile, "/"))-1]), 0700)
+	os.WriteFile(rl.histFile, []byte(strings.Join(rl.history, "\n")+"\n"), 0600)
+}
+
+type interruptError struct{}
+
+func (e *interruptError) Error() string { return "interrupt" }

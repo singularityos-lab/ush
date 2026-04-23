@@ -294,3 +294,262 @@ func envWithOverrides(env expand.Environ, overrides map[string]string) []string 
 	}
 	return out
 }
+
+func adaptVSCodeArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+
+	for _, a := range args[1:] {
+		switch a {
+		case "tunnel", "serve-web":
+			return args
+		}
+	}
+
+	out := append([]string{}, args...)
+	if !hasArgPrefix(out[1:], "--no-sandbox") {
+		out = append(out, "--no-sandbox")
+	}
+	if !hasArgPrefix(out[1:], "--user-data-dir") && !hasArgPrefix(out[1:], "--file-write") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			out = append(out, "--user-data-dir="+filepath.Join(home, ".local", "share", "ush", "vscode-user-data"))
+		}
+	}
+	return out
+}
+
+func hasArgPrefix(args []string, prefix string) bool {
+	for _, a := range args {
+		if a == prefix || strings.HasPrefix(a, prefix+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// openHandler handles file opening (passthrough to host for now).
+func openHandler(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+	return interp.DefaultOpenHandler()(ctx, path, flag, perm)
+}
+
+// prompt builds the shell prompt.
+func (sh *Shell) prompt() string {
+	cwd := ""
+	if sh.runner != nil {
+		cwd = sh.runner.Dir
+	}
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		} else {
+			cwd = "?"
+		}
+	}
+
+	// shorten $HOME to ~
+	home, _ := os.UserHomeDir()
+	if home != "" && strings.HasPrefix(cwd, home) {
+		cwd = "~" + cwd[len(home):]
+	}
+
+	user := os.Getenv("USER")
+	if user == "" {
+		user = "guest"
+	}
+
+	host, hostColor := "USH", "1;34" // blue
+	if os.Getenv("USH_PROFILE") == "dev" {
+		host, hostColor = "\U0001F527DSH", "1;38;5;202" // wrench, orange-red
+	}
+	return fmt.Sprintf("\033[1;32m%s\033[0m@\033[%sm%s\033[0m:\033[1;36m%s\033[0m$ ", user, hostColor, host, cwd)
+}
+
+// completionFunc returns the completion function for readline.
+func (sh *Shell) completionFunc() CompletionFunc {
+	return func(line string, pos int) (head string, completions []string, tail string) {
+		// Determine the word being completed: everything from the last space to cursor.
+		prefix := line[:pos]
+		lastSpace := strings.LastIndex(prefix, " ")
+		var word string
+		if lastSpace == -1 {
+			word = prefix
+		} else {
+			word = prefix[lastSpace+1:]
+		}
+
+		// Command completion (no space before cursor = first word).
+		if lastSpace == -1 {
+			completions = append(completions, completeCommands(word)...)
+			completions = append(completions, completeBuiltinCmds(word)...)
+			return line[:pos-len(word)], completions, line[pos:]
+		}
+
+		// First word determines context.
+		firstWord := strings.Fields(prefix)[0]
+
+		// pkg subcommand completion.
+		if firstWord == "pkg" {
+			fields := strings.Fields(prefix)
+			if len(fields) == 1 {
+				// "pkg " with trailing space: complete subcommands from empty.
+				completions = completePkgSubcommands(word)
+				return line[:pos-len(word)], completions, line[pos:]
+			}
+			if len(fields) == 2 && word != "" {
+				completions = completePkgSubcommands(word)
+				if len(completions) > 0 {
+					return line[:pos-len(word)], completions, line[pos:]
+				}
+			}
+			// After pkg subcommand, complete file paths.
+			completions = completeFiles(word)
+			return line[:pos-len(word)], completions, line[pos:]
+		}
+
+		// perm category completion.
+		if firstWord == "perm" {
+			fields := strings.Fields(prefix)
+			if len(fields) == 1 {
+				completions = completePermCategories(word)
+				return line[:pos-len(word)], completions, line[pos:]
+			}
+			if len(fields) == 2 && word != "" {
+				completions = completePermCategories(word)
+				if len(completions) > 0 {
+					return line[:pos-len(word)], completions, line[pos:]
+				}
+			}
+		}
+
+		// File/path completion.
+		completions = completeFiles(word)
+		return line[:pos-len(word)], completions, line[pos:]
+	}
+}
+
+// builtinPkg handles the pkg command as a builtin.
+func (sh *Shell) builtinPkg(ctx context.Context, args []string) error {
+	if sh.pkgMgr == nil {
+		hc := interp.HandlerCtx(ctx)
+		fmt.Fprintln(hc.Stderr, "pkg: manager not available")
+		return interp.NewExitStatus(1)
+	}
+
+	if len(args) == 0 {
+		hc := interp.HandlerCtx(ctx)
+		printPkgUsage(hc.Stdout)
+		return nil
+	}
+
+	hc := interp.HandlerCtx(ctx)
+
+	switch args[0] {
+	case "install", "i":
+		return sh.pkgMgr.Install(ctx, hc.Stdout, hc.Stderr, args[1:])
+	case "update":
+		return sh.pkgMgr.Update(ctx, hc.Stdout, hc.Stderr)
+	case "remove", "rm":
+		return sh.pkgMgr.Remove(ctx, hc.Stdout, hc.Stderr, args[1:])
+	case "fix":
+		return sh.pkgFix(ctx, hc, args[1:])
+	case "burn":
+		return sh.pkgMgr.Burn(ctx, hc.Stdout, hc.Stderr, args[1:])
+	case "diff":
+		return sh.pkgMgr.Diff(ctx, hc.Stdout)
+	case "inspect":
+		if len(args) < 2 {
+			fmt.Fprintln(hc.Stderr, "pkg inspect: specify a package")
+			return interp.NewExitStatus(1)
+		}
+		return sh.pkgMgr.Inspect(ctx, hc.Stdout, hc.Stderr, args[1])
+	case "freeze":
+		return sh.pkgMgr.Freeze(ctx, hc.Stdout)
+	case "list", "ls":
+		return sh.pkgMgr.List(ctx, hc.Stdout)
+	case "compat":
+		return sh.pkgCompat(ctx, hc, args[1:])
+	case "help", "--help", "-h":
+		printPkgUsage(hc.Stdout)
+		return nil
+	default:
+		fmt.Fprintf(hc.Stderr, "pkg: unknown command '%s'. Use 'pkg help'.\n", args[0])
+		return interp.NewExitStatus(1)
+	}
+}
+
+// resolveAppExe turns a user-supplied app name or path into the absolute,
+// symlink-resolved executable path. App trust is keyed on this so it matches
+// the kernel-reported /proc/<pid>/exe the supervisor checks, which the guest
+// cannot spoof (unlike the comm name). A bare name is looked up on PATH; an
+// absolute/relative path is used directly.
+// errShellRestart breaks the interactive loop so the guest exits and the parent
+// re-execs a fresh ush. It is recognized in RunInteractive.
+var errShellRestart = errors.New("ush: restart requested")
+
+// builtinRestart requests a full ush restart: it drops a sentinel file that the
+// host-side parent checks after the guest exits, then breaks the shell loop so
+// the guest tears down. The parent re-execs a clean ush, applying any startup-only
+// changes (trusted dev dirs, config, extra binds). The sentinel lives in the ush
+// runtime dir, the only host-shared writable surface, so no privileged path is
+// touched.
+func (sh *Shell) builtinRestart(ctx context.Context) error {
+	hc := interp.HandlerCtx(ctx)
+	rf := os.Getenv("USH_RESTART_FILE")
+	if rf == "" {
+		fmt.Fprintln(hc.Stderr, "restart: not supported in this session")
+		return interp.NewExitStatus(1)
+	}
+	if err := os.MkdirAll(filepath.Dir(rf), 0700); err != nil {
+		fmt.Fprintf(hc.Stderr, "restart: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	if err := os.WriteFile(rf, []byte("1\n"), 0600); err != nil {
+		fmt.Fprintf(hc.Stderr, "restart: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	fmt.Fprintln(hc.Stdout, "Restarting ush...")
+	return errShellRestart
+}
+
+// builtinDsh switches the session to the developer world (dsh). It asks the
+// broker for host-side confirmation; on approval it drops the become-dsh
+// sentinel and breaks the shell loop, and the parent re-execs into the dev
+// profile (replace, same terminal). A guest process can trigger the dialog but
+// cannot confirm it, so it is not an escalation path for sandboxed code.
+func (sh *Shell) builtinDsh(ctx context.Context) error {
+	hc := interp.HandlerCtx(ctx)
+	if os.Getenv("USH_PROFILE") == "dev" {
+		fmt.Fprintln(hc.Stdout, "Already in the developer shell (dsh).")
+		return nil
+	}
+	df := os.Getenv("USH_DSH_FILE")
+	if df == "" {
+		fmt.Fprintln(hc.Stderr, "dsh: not supported in this session")
+		return interp.NewExitStatus(1)
+	}
+	if !broker.IsAvailable() {
+		fmt.Fprintln(hc.Stderr, "dsh: broker not available")
+		return interp.NewExitStatus(1)
+	}
+	client, err := broker.NewClient(sh.sessionID)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "dsh: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	defer client.Close()
+	if !client.RequestDevShell() {
+		// Declined at the dialog, or refused by policy (disabled by the device
+		// image, or not enabled). The broker is the authority; we cannot tell the
+		// cases apart from here, so point at the host-side enable path.
+		fmt.Fprintln(hc.Stderr, "dsh: unavailable (not confirmed, or disabled/not enabled by policy)")
+		fmt.Fprintln(hc.Stderr, "     if it is just disabled, on the host run:  ush dsh enable")
+		return interp.NewExitStatus(1)
+	}
+	if err := os.WriteFile(df, []byte("1\n"), 0600); err != nil {
+		fmt.Fprintf(hc.Stderr, "dsh: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	fmt.Fprintln(hc.Stdout, "Entering developer shell (dsh)...")
+	return errShellRestart
+}

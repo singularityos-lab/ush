@@ -742,3 +742,212 @@ func findAptBin(name string) string {
 	}
 	return name // let the OS produce the error
 }
+
+func preloadShimEnv() (string, error) {
+	shimPath := "/run/ush/exec/ush-chown-shim.so"
+	if _, err := os.Stat(shimPath); err != nil {
+		return "", fmt.Errorf("LD_PRELOAD shim missing at %s: %w", shimPath, err)
+	}
+	return "LD_PRELOAD=" + shimPath, nil
+}
+
+func createPackageHookWrappers() (string, func(), error) {
+	dir, err := os.MkdirTemp("", "ush-pkg-hooks-*")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("pkg hooks: %w", err)
+	}
+
+	cleanup := func() { os.RemoveAll(dir) }
+	script := "#!/bin/sh\nexit 0\n"
+	for _, name := range []string{
+		"gtk-update-icon-cache",
+		"update-alternatives",
+		"update-desktop-database",
+		"update-mime-database",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0755); err != nil {
+			cleanup()
+			return "", func() {}, fmt.Errorf("pkg hooks: %w", err)
+		}
+	}
+
+	return dir, cleanup, nil
+}
+
+// cleanupCoreLibsFromPkgroot removes glibc runtime files from pkgroot that may
+// have been installed there by apt/dpkg despite path-exclude options (e.g. via
+// symlinks or triggers). These must come from the host base system only.
+func cleanupCoreLibsFromPkgroot(pkgPrefix string) {
+	globs := []string{
+		"usr/lib/*/libc.so.6",
+		"usr/lib/*/libc-*.so",
+		"lib/*/libc.so.6",
+		"usr/lib/*/ld-linux*.so*",
+		"lib/*/ld-linux*.so*",
+		"usr/lib/*/ld-*.so*",
+	}
+	for _, g := range globs {
+		matches, err := filepath.Glob(filepath.Join(pkgPrefix, g))
+		if err != nil {
+			continue
+		}
+		for _, p := range matches {
+			if err := os.Remove(p); err == nil {
+				ushlog.Info("pkg: removed conflicting core lib from pkgroot", "path", p)
+			}
+		}
+	}
+}
+
+// bindPkgShareDirs overlays pkgPrefix/usr/share on top of /usr/share so package
+// data files are visible at their hardcoded paths.
+func bindPkgShareDirs(pkgPrefix string) {
+	srcBase := filepath.Join(pkgPrefix, "usr", "share")
+	if _, err := os.Stat(srcBase); err != nil {
+		return
+	}
+	// Read-only overlay: pkgroot share dirs appear transparently on top.
+	opts := fmt.Sprintf("lowerdir=%s:/usr/share,userxattr", srcBase)
+	if err := unix.Mount("overlay", "/usr/share", "overlay", 0, opts); err != nil {
+		// userxattr not supported - try without it (older kernels).
+		opts = fmt.Sprintf("lowerdir=%s:/usr/share", srcBase)
+		if err := unix.Mount("overlay", "/usr/share", "overlay", 0, opts); err != nil {
+			ushlog.Warn("pkg: overlay /usr/share failed", "err", err)
+		}
+	}
+}
+
+// ensurePkgAdminDir creates (if it doesn't exist) a minimal dpkg admindir inside
+// pkgPrefix. This admindir is separate from the system's /var/lib/dpkg: it tracks
+// only what's installed in pkgPrefix, so apt doesn't confuse system packages with
+// prefix packages.
+// Returns the admindir path.
+func ensurePkgAdminDir(pkgPrefix string) (string, error) {
+	adminDir := filepath.Join(pkgPrefix, "var", "lib", "dpkg")
+	dirs := []string{
+		adminDir,
+		filepath.Join(adminDir, "info"),
+		filepath.Join(adminDir, "updates"),
+		filepath.Join(adminDir, "triggers"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return adminDir, err
+		}
+	}
+	// Create empty status if it doesn't exist (no packages installed in prefix).
+	statusFile := filepath.Join(adminDir, "status")
+	if _, err := os.Stat(statusFile); os.IsNotExist(err) {
+		if err := os.WriteFile(statusFile, nil, 0644); err != nil {
+			return adminDir, err
+		}
+	}
+	// Create empty Unincorp.
+	uninc := filepath.Join(adminDir, "triggers", "Unincorp")
+	if _, err := os.Stat(uninc); os.IsNotExist(err) {
+		os.WriteFile(uninc, nil, 0644) //nolint:errcheck
+	}
+
+	// dpkg sets DPKG_CHROOTDIR=pkgPrefix when running package scripts.
+	// Modern debconf prepends DPKG_CHROOTDIR to /etc/debconf.conf, so it
+	// looks for pkgPrefix/etc/debconf.conf - not the guest's /etc/debconf.conf.
+	// Create a minimal working debconf.conf and database dirs here.
+	if err := ensureDebconfInPkgroot(pkgPrefix); err != nil {
+		ushlog.Warn("pkg: debconf setup in pkgroot failed", "err", err)
+	}
+
+	return adminDir, nil
+}
+
+// ensureDebconfInPkgroot creates the minimal debconf config and database
+// directories needed by dpkg package scripts inside the pkgroot prefix.
+func ensureDebconfInPkgroot(pkgPrefix string) error {
+	// Try to copy the host's debconf.conf first (authoritative and complete).
+	hostConf := "/etc/debconf.conf"
+	dstConf := filepath.Join(pkgPrefix, "etc", "debconf.conf")
+	if err := os.MkdirAll(filepath.Dir(dstConf), 0755); err != nil {
+		return err
+	}
+	if _, err := os.Stat(dstConf); os.IsNotExist(err) {
+		if data, err := os.ReadFile(hostConf); err == nil {
+			os.WriteFile(dstConf, data, 0644) //nolint:errcheck
+		} else {
+			// Fallback: write a minimal debconf.conf.
+			minimal := "# Debconf config\nConfig: configdb\nTemplates: templatedb\n\nName: configdb\nDriver: File\nMode: 644\nFilename: /var/cache/debconf/config.dat\n\nName: templatedb\nDriver: File\nMode: 644\nFilename: /var/cache/debconf/templates.dat\n"
+			if err := os.WriteFile(dstConf, []byte(minimal), 0644); err != nil {
+				return err
+			}
+		}
+	}
+	// Create the debconf database directory and empty database files.
+	cacheDir := filepath.Join(pkgPrefix, "var", "cache", "debconf")
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return err
+	}
+	for _, f := range []string{"config.dat", "templates.dat", "passwords.dat"} {
+		p := filepath.Join(cacheDir, f)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			os.WriteFile(p, nil, 0600) //nolint:errcheck
+		}
+	}
+	return nil
+}
+
+// aptOutputFilter formats apt/dpkg output for the USH terminal.
+// Strips carriage-return progress updates, suppresses blank lines from
+// dpkg status messages, and color-codes key lines.
+type aptOutputFilter struct {
+	dst io.Writer
+	buf bytes.Buffer
+}
+
+func newAptOutputFilter(dst io.Writer) *aptOutputFilter {
+	return &aptOutputFilter{dst: dst}
+}
+
+func (f *aptOutputFilter) Write(p []byte) (int, error) {
+	f.buf.Write(p)
+	for {
+		line, err := f.buf.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				if err != nil {
+					f.buf.WriteString(line)
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "pmstatus:") || strings.HasPrefix(trimmed, "status:") {
+				if err != nil {
+					f.buf.WriteString(line)
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "Setting up ") {
+				trimmed = "\033[0;32m" + trimmed + "\033[0m"
+			}
+			if strings.HasPrefix(trimmed, "dpkg: error") || strings.HasPrefix(trimmed, "E: ") {
+				trimmed = "\033[1;31m" + trimmed + "\033[0m"
+			}
+			if strings.Contains(trimmed, "chown:") || strings.Contains(trimmed, "changing ownership") {
+				trimmed = "\033[2m" + trimmed + "\033[0m"
+			}
+			fmt.Fprintln(f.dst, trimmed)
+		}
+		if err != nil {
+			f.buf.WriteString(line)
+			break
+		}
+	}
+	return len(p), nil
+}
+
+// scriptLogger is a writer that logs apt/dpkg output line by line.
+type scriptLogger struct {
+	name string
+	buf  bytes.Buffer
+}
+
+func newScriptLogger(name string) *scriptLogger {
+	return &scriptLogger{name: name}
+}

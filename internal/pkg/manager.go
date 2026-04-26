@@ -951,3 +951,160 @@ type scriptLogger struct {
 func newScriptLogger(name string) *scriptLogger {
 	return &scriptLogger{name: name}
 }
+
+func (sl *scriptLogger) Write(p []byte) (int, error) {
+	sl.buf.Write(p)
+	for {
+		line, err := sl.buf.ReadString('\n')
+		if len(line) > 0 {
+			ushlog.Debug("pkg: apt output", "name", sl.name, "line", strings.TrimRight(line, "\n"))
+		}
+		if err != nil {
+			sl.buf.WriteString(line)
+			break
+		}
+	}
+	return len(p), nil
+}
+
+// dpkgListFiles returns the files installed by a dpkg package.
+func dpkgListFiles(pkg string) ([]string, error) {
+	out, err := runCmdOutput("dpkg", "-L", pkg)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && line != "/" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+// classifyScript classifies the risk of a maintainer script from a file.
+func classifyScript(path string) ScriptRisk {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return RiskSafe
+	}
+	return classifyScriptContent(string(data))
+}
+
+// riskPatterns maps regex -> risk.
+var riskPatterns = []struct {
+	re   *regexp.Regexp
+	risk ScriptRisk
+}{
+	// BLOCK
+	{regexp.MustCompile(`chmod\s+[+]s|setcap|chown\s+root`), RiskBlock},
+	{regexp.MustCompile(`modprobe|insmod|rmmod`), RiskBlock},
+	{regexp.MustCompile(`/proc/sys/|/sys/`), RiskBlock},
+	{regexp.MustCompile(`mknod\s`), RiskBlock},
+	// WARN
+	{regexp.MustCompile(`systemctl\s+(enable|start|stop|restart|daemon-reload)`), RiskWarn},
+	{regexp.MustCompile(`dbus-send|gdbus\s+call`), RiskWarn},
+	{regexp.MustCompile(`adduser|useradd|groupadd`), RiskWarn},
+	{regexp.MustCompile(`update-rc\.d|invoke-rc\.d`), RiskWarn},
+	{regexp.MustCompile(`ldconfig`), RiskWarn},
+	{regexp.MustCompile(`update-alternatives`), RiskWarn},
+}
+
+// classifyScriptContent classifies the content of a script.
+func classifyScriptContent(content string) ScriptRisk {
+	risk := RiskSafe
+	for _, p := range riskPatterns {
+		if p.re.MatchString(content) {
+			if p.risk == RiskBlock {
+				return RiskBlock
+			}
+			risk = RiskWarn
+		}
+	}
+	return risk
+}
+
+// findUnits finds systemd units created by a package.
+func findUnits(pkg string) []string {
+	files, err := dpkgListFiles(pkg)
+	if err != nil {
+		return nil
+	}
+	var units []string
+	for _, f := range files {
+		if strings.HasSuffix(f, ".service") ||
+			strings.HasSuffix(f, ".socket") ||
+			strings.HasSuffix(f, ".timer") {
+			units = append(units, f)
+		}
+	}
+	return units
+}
+
+func runCmdOutput(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+func runCmdIn(dir string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	return cmd.Run()
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// PackageInfo is used for inspect JSON.
+type PackageInfo struct {
+	Name      string     `json:"name"`
+	Version   string     `json:"version"`
+	Files     []string   `json:"files,omitempty"`
+	Scripts   []string   `json:"scripts,omitempty"`
+	Units     []string   `json:"units,omitempty"`
+	Risk      ScriptRisk `json:"risk"`
+	InspectAt time.Time  `json:"inspect_at"`
+}
+
+// InspectJSON returns inspect information as JSON.
+func (m *Manager) InspectJSON(pkg string) (*PackageInfo, error) {
+	info := &PackageInfo{
+		Name:      pkg,
+		InspectAt: time.Now(),
+		Risk:      RiskSafe,
+	}
+
+	dpkgInfo, _ := runCmdOutput("dpkg", "-s", pkg)
+	for _, line := range strings.Split(dpkgInfo, "\n") {
+		if strings.HasPrefix(line, "Version: ") {
+			info.Version = strings.TrimPrefix(line, "Version: ")
+		}
+	}
+
+	info.Files, _ = dpkgListFiles(pkg)
+	info.Units = findUnits(pkg)
+
+	scripts := []string{"preinst", "postinst", "prerm", "postrm"}
+	for _, s := range scripts {
+		path := filepath.Join("/var/lib/dpkg/info", pkg+"."+s)
+		if _, err := os.Stat(path); err == nil {
+			info.Scripts = append(info.Scripts, s)
+			if r := classifyScript(path); r > info.Risk {
+				info.Risk = r
+			}
+		}
+	}
+
+	return info, nil
+}
+
+// MarshalJSON for ScriptRisk (already a string, no override needed).
+var _ = json.Marshal

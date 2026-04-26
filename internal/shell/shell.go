@@ -821,3 +821,127 @@ func completeBuiltinCmds(prefix string) []string {
 	}
 	return matches
 }
+
+// completePkgSubcommands completes pkg subcommands.
+func completePkgSubcommands(prefix string) []string {
+	subcmds := []string{"install", "update", "remove", "fix", "burn", "diff", "inspect", "freeze", "list", "compat", "help"}
+	var matches []string
+	for _, s := range subcmds {
+		if strings.HasPrefix(s, prefix) {
+			matches = append(matches, s)
+		}
+	}
+	return matches
+}
+
+// completePermCategories completes perm categories.
+func completePermCategories(prefix string) []string {
+	cats := []string{"network", "filesystem", "device", "service", "trust", "untrust"}
+	var matches []string
+	for _, c := range cats {
+		if strings.HasPrefix(c, prefix) {
+			matches = append(matches, c)
+		}
+	}
+	return matches
+}
+
+// pkgCompat implements 'pkg compat [package]'.
+func (sh *Shell) pkgCompat(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	checker := compat.NewChecker(hc.Stdout, hc.Stderr)
+
+	if len(args) == 0 {
+		// Full test suite.
+		return compat.RunTestSuite(ctx, hc.Stdout)
+	}
+
+	// Single package analysis.
+	profile, err := checker.CheckPackage(ctx, args[0])
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "pkg compat: %v\n", err)
+		return interp.NewExitStatus(1)
+	}
+	checker.Report(hc.Stdout, profile)
+	return nil
+}
+
+// lastWord extracts the last word from the string.
+func lastWord(s string) string {
+	parts := strings.Fields(s)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+// completeCommands completes available commands in PATH.
+func completeCommands(prefix string) []string {
+	var matches []string
+	paths := filepath.SplitList(os.Getenv("PATH"))
+	seen := map[string]bool{}
+	for _, dir := range paths {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, prefix) && !seen[name] {
+				matches = append(matches, name)
+				seen[name] = true
+				if len(matches) > 100 {
+					return matches
+				}
+			}
+		}
+	}
+	return matches
+}
+
+// completeFiles completes file paths.
+func completeFiles(prefix string) []string {
+	var dir, base string
+	if prefix == "" {
+		dir = "."
+		base = ""
+	} else if strings.HasSuffix(prefix, "/") {
+		dir = prefix
+		base = ""
+	} else {
+		dir = filepath.Dir(prefix)
+		base = filepath.Base(prefix)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+
+	var matches []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, base) {
+			match := filepath.Join(dir, name)
+			if e.IsDir() {
+				match += "/"
+			}
+			matches = append(matches, match)
+		}
+	}
+	return matches
+}
+
+func isExitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	_, ok := interp.IsExitStatus(err)
+	return ok && err.Error() == "exit status 0"
+}
+
+func isInterrupt(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "interrupt")
+}
+
+// ushlog reference to avoid import cycle warning
+var _ = ushlog.Info

@@ -216,3 +216,182 @@ func fetchPackageIndex() (string, error) {
 	}
 	return string(out), nil
 }
+
+// findPackageURL searches the Packages index for the Filename field of a package.
+func findPackageURL(index, pkgName string) (string, error) {
+	var inPkg bool
+	var filename string
+	for _, line := range strings.Split(index, "\n") {
+		if strings.HasPrefix(line, "Package: ") {
+			name := strings.TrimPrefix(line, "Package: ")
+			inPkg = (name == pkgName)
+			filename = ""
+		}
+		if inPkg && strings.HasPrefix(line, "Filename: ") {
+			filename = strings.TrimPrefix(line, "Filename: ")
+		}
+		if inPkg && filename != "" && line == "" {
+			return filename, nil
+		}
+	}
+	if filename != "" {
+		return filename, nil
+	}
+	return "", fmt.Errorf("package %q not found", pkgName)
+}
+
+func downloadURL(url string) ([]byte, error) {
+	resp, err := httpClient.Get(url) //nolint:gosec
+	if err != nil {
+		return nil, fmt.Errorf("http get %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d for %s", resp.StatusCode, url)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// extractDeb extracts the contents of a .deb archive into destDir.
+// .deb format is an ar archive containing data.tar.{gz,xz,zst,bz2}.
+func extractDeb(debData []byte, destDir string) error {
+	// Verify ar magic.
+	if len(debData) < 8 || string(debData[:8]) != "!<arch>\n" {
+		return fmt.Errorf("not a valid ar archive")
+	}
+
+	r := bytes.NewReader(debData[8:])
+	for {
+		// Read ar header (60 bytes).
+		var hdr [60]byte
+		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return fmt.Errorf("read ar header: %w", err)
+		}
+
+		// Magic check.
+		if string(hdr[58:60]) != "`\n" {
+			return fmt.Errorf("invalid ar magic")
+		}
+
+		name := strings.TrimRight(string(hdr[0:16]), " /")
+		sizeStr := strings.TrimSpace(string(hdr[48:58]))
+		var size int64
+		fmt.Sscanf(sizeStr, "%d", &size)
+
+		// Read ar content.
+		content := make([]byte, size)
+		if _, err := io.ReadFull(r, content); err != nil {
+			return fmt.Errorf("read ar content %s: %w", name, err)
+		}
+		// Align to 2 bytes.
+		if size%2 != 0 {
+			var pad [1]byte
+			r.Read(pad[:]) //nolint:errcheck
+		}
+
+		// Search for data.tar.* and extract it.
+		if strings.HasPrefix(name, "data.tar") {
+			if err := extractTar(name, content, destDir); err != nil {
+				return fmt.Errorf("extract tar %s: %w", name, err)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("data.tar not found in .deb")
+}
+
+// extractTar extracts a tar archive (with various compressions) into destDir.
+func extractTar(name string, data []byte, destDir string) error {
+	var r io.Reader = bytes.NewReader(data)
+
+	switch {
+	case strings.HasSuffix(name, ".gz"):
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		r = gz
+	case strings.HasSuffix(name, ".bz2"):
+		r = bzip2.NewReader(r)
+	case strings.HasSuffix(name, ".xz"):
+		// xz not in stdlib; use xz command if available.
+		return extractTarXZ(data, destDir)
+	case strings.HasSuffix(name, ".zst"):
+		return extractTarZst(data, destDir)
+	}
+
+	return extractTarReader(r, destDir)
+}
+
+func extractTarXZ(data []byte, destDir string) error {
+	xzCmd, err := exec.LookPath("xz")
+	if err != nil {
+		// Try tar directly (supports xz natively on GNU tar).
+		return extractTarWithCmd(data, destDir, "tar", "--xz")
+	}
+	_ = xzCmd
+	return extractTarWithCmd(data, destDir, "tar", "--xz")
+}
+
+func extractTarZst(data []byte, destDir string) error {
+	return extractTarWithCmd(data, destDir, "tar", "--zstd")
+}
+
+func extractTarWithCmd(data []byte, destDir string, tarBin string, extraFlag string) error {
+	args := []string{"-xf", "-", "-C", destDir}
+	if extraFlag != "" {
+		args = []string{extraFlag, "-xf", "-", "-C", destDir}
+	}
+	cmd := exec.Command(tarBin, args...)
+	cmd.Stdin = bytes.NewReader(data)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func extractTarReader(r io.Reader, destDir string) error {
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(destDir, hdr.Name)
+		// Security: prevent path traversal.
+		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destDir)) {
+			continue
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			os.MkdirAll(target, os.FileMode(hdr.Mode))
+		case tar.TypeReg:
+			os.MkdirAll(filepath.Dir(target), 0755)
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode))
+			if err != nil {
+				continue
+			}
+			io.Copy(f, tr) //nolint:errcheck
+			f.Close()
+		case tar.TypeSymlink:
+			os.MkdirAll(filepath.Dir(target), 0755)
+			os.Remove(target)
+			os.Symlink(hdr.Linkname, target) //nolint:errcheck
+		case tar.TypeLink:
+			os.MkdirAll(filepath.Dir(target), 0755)
+			os.Link(filepath.Join(destDir, hdr.Linkname), target) //nolint:errcheck
+		}
+	}
+	return nil
+}
+
+// keep the encoding/binary import referenced
+var _ = binary.LittleEndian

@@ -308,3 +308,121 @@ func (v *LayerVFS) loadDirFromHost(dir string) (*VFSInode, error) {
 
 	return root, nil
 }
+
+func (v *LayerVFS) allocIno() uint64 {
+	v.nextIno++
+	return v.nextIno
+}
+
+type vfsFileInfo struct {
+	node *VFSInode
+	path string
+}
+
+func (fi *vfsFileInfo) Name() string       { return filepath.Base(fi.path) }
+func (fi *vfsFileInfo) Size() int64        { return fi.node.size }
+func (fi *vfsFileInfo) Mode() fs.FileMode  { return fi.node.mode }
+func (fi *vfsFileInfo) ModTime() time.Time { return fi.node.mtime }
+func (fi *vfsFileInfo) IsDir() bool        { return fi.node.isDir }
+func (fi *vfsFileInfo) Sys() any           { return nil }
+
+// Integrity helpers for the Singularity Guard.
+//
+// The integrity monitor (singd) detects when a ush layer shadows or diverges
+// from an immutable system file; raven already understands layer semantics.
+
+// HashLayer walks a layer directory and returns a map of guest-absolute path
+// (e.g. "/usr/bin/foo") to the SHA-256 (hex) of the file's contents. Symlinks,
+// whiteouts (.wh.*) and non-regular files are skipped.
+func HashLayer(dir string) (map[string]string, error) {
+	out := make(map[string]string)
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if strings.HasPrefix(filepath.Base(path), ".wh.") {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return nil
+		}
+		sum, err := sha256File(path)
+		if err != nil {
+			return nil
+		}
+		out["/"+filepath.ToSlash(rel)] = sum
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// BaselineDiff reports how a layer relates to the signed system baseline.
+type BaselineDiff struct {
+	// Shadowed: layer files whose path also exists in the baseline, the layer
+	// overrides an immutable system file (a classic persistence technique).
+	Shadowed []string `json:"shadowed"`
+	// Modified: shadowed paths whose content hash differs from the baseline.
+	Modified []string `json:"modified"`
+	// New: layer files with no counterpart in the baseline.
+	New []string `json:"new"`
+}
+
+type signedBaseline struct {
+	Files map[string]string `json:"files"`
+}
+
+// DiffAgainstBaseline hashes layerDir and compares it to the baseline JSON
+// produced at OS build time (/etc/singularity/baseline.json). The caller must
+// verify the baseline signature before trusting it; this function only
+// computes the set difference (shadowed / modified / new).
+func DiffAgainstBaseline(layerDir, baselinePath string) (*BaselineDiff, error) {
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		return nil, fmt.Errorf("read baseline: %w", err)
+	}
+	var base signedBaseline
+	if err := json.Unmarshal(raw, &base); err != nil {
+		return nil, fmt.Errorf("parse baseline: %w", err)
+	}
+
+	layer, err := HashLayer(layerDir)
+	if err != nil {
+		return nil, err
+	}
+
+	diff := &BaselineDiff{}
+	for path, sum := range layer {
+		if baseSum, ok := base.Files[path]; ok {
+			diff.Shadowed = append(diff.Shadowed, path)
+			if baseSum != sum {
+				diff.Modified = append(diff.Modified, path)
+			}
+		} else {
+			diff.New = append(diff.New, path)
+		}
+	}
+	sort.Strings(diff.Shadowed)
+	sort.Strings(diff.Modified)
+	sort.Strings(diff.New)
+	return diff, nil
+}

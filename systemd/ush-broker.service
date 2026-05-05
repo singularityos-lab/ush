@@ -1,0 +1,17 @@
+[Unit]
+Description=USH Permission Broker
+Documentation=https://github.com/singularityos-lab/ush
+After=dbus.service graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ush-broker
+Restart=on-failure
+RestartSec=5s
+# Limits broker memory usage.
+MemoryMax=64M
+# No access to user files beyond what is necessary.
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -927,3 +927,111 @@ func seedContainersConfig(homeDir string) {
 		"[storage]\ndriver = \"overlay\"\n\n"+
 			"[storage.options.overlay]\nmount_program = \"\"\n"), 0644)
 }
+
+// seedSubIDDelegation rewrites the guest /etc/subuid and /etc/subgid so nested
+// rootless podman/distrobox work. The host entries point at the user's host-level
+// subordinate range (e.g. 165536+), but those ids are NOT mapped inside the dsh
+// guest user namespace, so newuidmap cannot map a nested container onto them and
+// fails with EPERM. We instead delegate the slice of guest ids ABOVE the user's
+// own id, all of which the guest userns maps, so the nested map lands on valid
+// targets. Range and owner are read from the live id maps, so this is correct
+// regardless of the user's real uid.
+func seedSubIDDelegation() {
+	name := strconv.Itoa(os.Getuid())
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		name = u.Username
+	}
+	write := func(idFile, mapFile string, ownID int) {
+		max := maxMappedID(mapFile)
+		if max <= ownID {
+			return // nothing above the user's id to delegate
+		}
+		line := fmt.Sprintf("%s:%d:%d\n", name, ownID+1, max-ownID)
+		_ = os.WriteFile(idFile, []byte(line), 0644)
+	}
+	write("/etc/subuid", "/proc/self/uid_map", os.Getuid())
+	write("/etc/subgid", "/proc/self/gid_map", os.Getgid())
+}
+
+// maxMappedID returns the highest container id mapped in a /proc/<pid>/{uid,gid}_map
+// file (container-start + size of the last range), or -1 if it cannot be read.
+func maxMappedID(mapFile string) int {
+	data, err := os.ReadFile(mapFile)
+	if err != nil {
+		return -1
+	}
+	max := -1
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		start, e1 := strconv.Atoi(f[0])
+		size, e2 := strconv.Atoi(f[2])
+		if e1 != nil || e2 != nil {
+			continue
+		}
+		if end := start + size - 1; end > max {
+			max = end
+		}
+	}
+	return max
+}
+
+// printDshNotice warns, on every dsh start, that it is not a security boundary.
+func printDshNotice(homeDir string) {
+	fmt.Printf("  \033[1;38;5;202mNOT a security sandbox\033[0m: code you run here has a real dev machine.\n\n")
+}
+
+// printModelNoticeOnce explains the write-isolation model on the first
+// interactive run only. The marker lives in the persistent guest home, so it
+// survives across sessions and is shown exactly once.
+func printModelNoticeOnce(homeDir string) {
+	if homeDir == "" {
+		homeDir = os.Getenv("HOME")
+	}
+	if homeDir == "" {
+		return
+	}
+	marker := filepath.Join(homeDir, ".ush_intro_seen")
+	if _, err := os.Stat(marker); err == nil {
+		return
+	}
+	fmt.Printf("\n  \033[33mYour real files are safe by default.\033[0m You can read your whole home, but\n")
+	fmt.Printf("  changes are saved inside the sandbox. To work on the real files in a folder,\n")
+	fmt.Printf("  run \033[1mperm trust-dir\033[0m there, then \033[1mrestart\033[0m.\n\n")
+	_ = os.WriteFile(marker, []byte("1\n"), 0600)
+}
+
+func chdirGuestStart(homeDir, startCWD string) {
+	startDir := guestStartDir(homeDir, startCWD)
+	if startDir == "" {
+		startDir = "/"
+	}
+	if err := os.Chdir(startDir); err == nil {
+		return
+	}
+	if homeDir != "" && startDir != homeDir {
+		if err := os.Chdir(homeDir); err == nil {
+			return
+		}
+	}
+	if err := os.Chdir("/"); err != nil {
+		ushlog.Warn("ush: unable to set guest working directory", "err", err)
+	}
+}
+
+func guestStartDir(homeDir, startCWD string) string {
+	home := filepath.Clean(homeDir)
+	if home == "." || home == "/" {
+		return "/"
+	}
+
+	cwd := filepath.Clean(startCWD)
+	if filepath.IsAbs(cwd) {
+		if rel, err := filepath.Rel(home, cwd); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return cwd
+		}
+	}
+	return home
+}

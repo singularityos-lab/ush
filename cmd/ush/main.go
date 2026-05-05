@@ -1035,3 +1035,149 @@ func guestStartDir(homeDir, startCWD string) string {
 	}
 	return home
 }
+
+// configureGuestNetwork brings up the loopback and any TAP interface created by
+// pasta in this network namespace. Without this, pasta creates the interface
+// but it remains DOWN. We also configure IP/route if pasta hasn't via --config-net.
+func configureGuestNetwork() {
+	// Always bring up loopback.
+	runSilent("ip", "link", "set", "lo", "up")
+
+	// Bring up any non-loopback interface (pasta's TAP).
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == "lo" {
+			continue
+		}
+		runSilent("ip", "link", "set", name, "up")
+		ushlog.Info("ush: network interface up", "iface", name)
+	}
+}
+
+// runSilent runs a command discarding output (best-effort).
+func runSilent(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	_ = cmd.Run()
+}
+
+// startPastaForChild starts pasta from the parent (host) network namespace,
+// pointing at the child process's network namespace via its PID.
+// This is the correct way to use pasta: run it outside the new empty net
+// namespace so it can bridge the child's namespace to the host network.
+func startPastaForChild(cfg *config.Config, childPID int) {
+	pastaPath, err := findInPath([]string{
+		"/usr/bin/pasta",
+		"/usr/sbin/pasta",
+		"/bin/pasta",
+	})
+	if err != nil {
+		ushlog.Warn("ush: pasta not found, network isolation unavailable", "err", err)
+		return
+	}
+
+	// Give the child a moment to finish namespace setup.
+	time.Sleep(200 * time.Millisecond)
+
+	pidStr := strconv.Itoa(childPID)
+	cmd := exec.Command(pastaPath,
+		"--foreground",
+		"--config-net",                         // auto-configure tap interface in the namespace
+		"--dns", "1.1.1.1", "--dns", "8.8.8.8", // explicit DNS
+		"--ipv4-only", // skip IPv6 (also avoids no-route IPv6 stalls)
+		// Forward ports the guest binds back to the host loopback, so services
+		// the GUEST starts are reachable from the host, while the guest still
+		// cannot see host services (it has its own loopback). This is the
+		// asymmetry: host sees into the guest, the guest cannot see the host.
+		"-t", "auto",
+		"-u", "auto",
+		pidStr,
+	)
+	cmd.Stderr = os.Stderr
+	if os.Getenv("USH_VERBOSE") == "" {
+		cmd.Stderr = io.Discard
+	}
+	if err := cmd.Start(); err != nil {
+		ushlog.Warn("ush: pasta start failed", "err", err)
+		return
+	}
+	ushlog.Info("ush: pasta network started", "child_pid", childPID)
+	// pasta runs until the child exits; we don't need to wait for it here.
+}
+
+func findInPath(candidates []string) (string, error) {
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("not found")
+}
+
+func printBanner(sessionID string) {
+	w := os.Stdout
+
+	// If the host admin placed a custom motd, print it and stop.
+	if motd := strings.TrimSpace(os.Getenv("USH_MOTD")); motd != "" {
+		fmt.Fprintf(w, "\n%s\n\n", motd)
+		return
+	}
+
+	name, color := "ush", "1;34" // blue
+	if os.Getenv("USH_PROFILE") == "dev" {
+		name, color = "\U0001F527 dsh", "1;38;5;202" // wrench, orange-red
+	}
+	fmt.Fprintf(w, "\n\033[%sm%s\033[0m  \033[2msession %s\033[0m\n", color, name, sessionID)
+	fmt.Fprintf(w, "\033[2m%s\033[0m\n", strings.Repeat("-", 44))
+	fmt.Fprintf(w, "  Use \033[1mpkg install <name>\033[0m to install software.\n")
+	fmt.Fprintf(w, "  Use \033[1mpkg help\033[0m for the list of pkg commands.\n\n")
+}
+
+// addPkgPrefixToPath prepends standard pkgPrefix paths to $PATH and $LD_LIBRARY_PATH.
+func addPkgPrefixToPath(prefix string) {
+	binPaths := []string{
+		filepath.Join(prefix, "usr", "bin"),
+		filepath.Join(prefix, "usr", "sbin"),
+		filepath.Join(prefix, "usr", "games"),
+		filepath.Join(prefix, "bin"),
+		filepath.Join(prefix, "sbin"),
+	}
+	existing := os.Getenv("PATH")
+	os.Setenv("PATH", strings.Join(binPaths, ":")+":"+existing)
+
+	libPaths := []string{
+		filepath.Join(prefix, "usr", "lib", "x86_64-linux-gnu"),
+		filepath.Join(prefix, "usr", "lib"),
+		filepath.Join(prefix, "lib", "x86_64-linux-gnu"),
+		filepath.Join(prefix, "lib"),
+	}
+	// Dev: register the pkg-layer libs through /etc/ld.so.conf.d + ldconfig
+	// instead of LD_LIBRARY_PATH. The env var is forwarded into distrobox/podman
+	// containers, where the guest libs then shadow the container's own (e.g.
+	// "libpcre2 no version information available"); a per-root ld.so config does
+	// not cross the container boundary. ld.so.conf.d is rebuilt from a writable
+	// /etc tmpfs that the guest setup already prepared.
+	if os.Getenv("USH_PROFILE") == "dev" {
+		var b strings.Builder
+		for _, p := range libPaths {
+			b.WriteString(p)
+			b.WriteByte('\n')
+		}
+		if err := os.WriteFile("/etc/ld.so.conf.d/00-ush-pkglayer.conf", []byte(b.String()), 0644); err == nil {
+			_ = exec.Command("ldconfig").Run()
+			return
+		}
+		// Fall through to the env var if the config could not be written.
+	}
+	existingLib := os.Getenv("LD_LIBRARY_PATH")
+	if existingLib != "" {
+		os.Setenv("LD_LIBRARY_PATH", strings.Join(libPaths, ":")+":"+existingLib)
+	} else {
+		os.Setenv("LD_LIBRARY_PATH", strings.Join(libPaths, ":"))
+	}
+}

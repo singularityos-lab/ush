@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 0.1.0
+  LDFLAGS: -X github.com/singularityos-lab/ush/internal/config.AppVersion=0.1.0
+
+jobs:
+  # Stage 1: formatting and static analysis. Fast gate, fails early.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^vendor/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+
+  # Stage 2: everything compiles.
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+
+  # Stage 3: unit tests under the race detector.
+  unit:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+
+  # Stage 4: supply-chain and SAST. govulncheck gates; gosec is advisory.
+  security:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+      - name: gosec (advisory)
+        continue-on-error: true
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -severity high -confidence medium ./...
+
+  # Stage 5: integrity. Verifies module checksums and that the LD_PRELOAD
+  # shim's C source still compiles: the guest builds it at runtime, so it must
+  # not bit-rot.
+  integrity:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go mod verify
+        run: go mod verify
+      - name: shim source compiles
+        run: |
+          python3 - <<'PY'
+          src = open('internal/preload/chown_shim.go').read()
+          i = src.index('var DpkgShimC = `') + len('var DpkgShimC = `')
+          j = src.index('`', i)
+          open('/tmp/shim.c', 'w').write(src[i:j])
+          PY
+          cc -shared -fPIC -o /tmp/ush-chown-shim.so /tmp/shim.c
+          echo "shim C source compiles cleanly"
+
+  # Stage 6: adversarial end-to-end harness. Runs the secure ush profile under
+  # real namespaces and replays breach scenarios with the broker in AUTO mode.
+  # Needs unprivileged user namespaces (disabled by AppArmor on newer Ubuntu).
+  integration:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: runtime deps
+        run: sudo apt-get update && sudo apt-get install -y dbus
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: red-team harness
+        run: make redteam
+
+  # Final stage: only if EVERY stage above passed, cross-compile the release
+  # binaries and upload them as artifacts.
+  release:
+    needs: [lint, build, unit, security, integrity, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: cross-compile (CGO-free)
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 \
+              go build -ldflags "$LDFLAGS" -o "dist/ush-linux-$arch" ./cmd/ush
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 \
+              go build -ldflags "$LDFLAGS" -o "dist/ush-broker-linux-$arch" ./cmd/ush-broker
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ush-binaries-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error

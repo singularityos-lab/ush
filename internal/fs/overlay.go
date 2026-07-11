@@ -321,8 +321,8 @@ func (g *GuestFS) setupUsr() error {
 
 // setupEtc populates the guest /etc from the host by copying into a tmpfs so
 // maintainer scripts can write to it. It does not use overlayfs because /etc may
-// already be overlayfs (which cannot be stacked in a user namespace) as on
-// ABRoot/Vanilla OS systems.
+// already be overlayfs (which cannot be stacked in a user namespace) on
+// immutable, overlay-root hosts.
 func (g *GuestFS) setupEtc() error {
 	etcDst := filepath.Join(g.GuestRoot, "etc")
 
@@ -397,11 +397,11 @@ func (g *GuestFS) setupEtc() error {
 
 	// Ensure a minimal debconf.conf exists so that Debian package preinst/postinst
 	// scripts that invoke debconf don't fail with "No config file found".
-	// On non-Debian hosts (Vanilla OS, Fedora…) this file doesn't exist.
+	// On non-Debian hosts this file doesn't exist.
 	ensureDebconfConf(etcDst)
 
 	// Ensure a valid Debian sources.list in the guest.
-	// On Vanilla OS / non-Debian systems there is no sources.list.
+	// On non-Debian systems there is no sources.list.
 	// If created from scratch, invalidate the apt lists (they might be from another distro).
 	if ensureDebianSources(filepath.Join(etcDst, "apt")) {
 		if err := invalidateAptLists(g.GuestRoot); err != nil {
@@ -414,7 +414,7 @@ func (g *GuestFS) setupEtc() error {
 }
 
 // ensureDebianSources ensures that /etc/apt/sources.list in the guest contains
-// at least one valid Debian entry. On non-Debian systems (Vanilla OS, Fedora…)
+// at least one valid Debian entry. On non-Debian systems
 // there is no sources.list, so apt finds no packages.
 // Returns true if it created/replaced the sources.list (lists must be re-downloaded).
 func ensureDebianSources(aptDir string) bool {
@@ -442,7 +442,7 @@ func ensureDebianSources(aptDir string) bool {
 	}
 	ushlog.Info("fs: Debian sources.list created (non-Debian system detected)")
 
-	// Remove sources.list.d to avoid host repos (e.g. VanillaOS, Ubuntu PPA).
+	// Remove sources.list.d to avoid host repos (e.g. third-party PPAs).
 	sourcesD := filepath.Join(aptDir, "sources.list.d")
 	if entries, err := os.ReadDir(sourcesD); err == nil {
 		for _, e := range entries {
@@ -729,7 +729,7 @@ func (g *GuestFS) setupVar() error {
 	// installs. Package installations persist via --instdir=pkgroot (on disk).
 
 	// The apt lists come from the host and may not match the guest's
-	// Debian sources.list (e.g. host is Ubuntu/Vanilla OS).
+	// Debian sources.list (e.g. a Debian-derivative host).
 	// Always clear them: apt-get update recreates them in seconds.
 	invalidateAptLists(varDst) //nolint:errcheck
 
@@ -780,8 +780,8 @@ func (g *GuestFS) bindHome() error {
 		return fmt.Errorf("fs: bind guest home: %w", err)
 	}
 
-	// 2. Expose the real home DATA dirs, write-isolated by default (the
-	//    ChromeOS/Crostini model). The guest READS the host directory but every
+	// 2. Expose the real home DATA dirs, write-isolated by default: the guest
+	//    READS the host directory but every
 	//    write diverges into a guest-private overlay: nothing it writes reaches
 	//    the real host tree, and nothing it drops there can be built or executed
 	//    by the host. This closes the whole "guest writes what the host later

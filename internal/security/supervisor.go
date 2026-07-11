@@ -213,7 +213,7 @@ type Supervisor struct {
 	devMode       atomic.Bool // true: dsh developer world, audit-only (sticky)
 	netnsIsolated atomic.Bool // true when the guest has its OWN net namespace
 	builtinNet    atomic.Bool // true: service egress via fd injection (no pasta)
-	simpleMode    atomic.Bool // true: Android-style capability prompts (default)
+	simpleMode    atomic.Bool // true: per-app capability prompts (default)
 	sink          EventSink   // optional behavioural telemetry feed (singd)
 
 	// execStrip holds the guest-absolute path prefixes that are bound read-write
@@ -683,7 +683,7 @@ func (s *Supervisor) handleConnect(n *seccompNotif) seccompNotifResp {
 	// Behavioural telemetry: outbound connection to a non-local address.
 	s.emit(guardproto.EventConnect, n.PID, "", resource, "")
 
-	// Simple (Android-style) mode: the network capability "just works". The host
+	// Simple mode: the network capability "just works". The host
 	// is protected structurally (isolated netns, sensitive host ports already
 	// hard-denied above), so external egress does not prompt per-IP. Fine mode
 	// falls through to per-destination broker mediation below.
@@ -789,7 +789,7 @@ func (s *Supervisor) handleOpenat(n *seccompNotif) seccompNotifResp {
 		return allow
 	}
 
-	// Simple (Android-style) mode: decide per (app, capability), once, with a
+	// Simple mode: decide per (app, capability), once, with a
 	// human prompt ("X wants to use the Camera"), instead of per device path.
 	if s.simpleMode.Load() {
 		exe := procExe(n.PID)

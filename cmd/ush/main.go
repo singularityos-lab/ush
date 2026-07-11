@@ -385,7 +385,7 @@ func runParent(cfg *config.Config) error {
 			supervisor.SetNetnsIsolated(enableNet)
 			// Built-in networking: service egress via fd injection (no pasta).
 			supervisor.SetBuiltinNet(builtinNet)
-			// Permission UX: simple (Android-style) by default, fine on request.
+			// Permission UX: simple (per-app prompts) by default, fine on request.
 			supervisor.SetSimplePermissions(cfg.PermissionMode != "fine")
 			// Developer (dsh) profile: the supervisor audits but does not enforce,
 			// so it never fights the nested container runtime. dsh is a dev world,

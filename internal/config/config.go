@@ -49,7 +49,7 @@ type Config struct {
 	LogLevel string `json:"log_level,omitempty"`
 
 	// PermissionMode controls how the broker asks for permission.
-	//   "simple" (default): Android-style. Network just works (the host is
+	//   "simple" (default): per-app prompts. Network just works (the host is
 	//       protected structurally), and only sensitive capabilities (camera,
 	//       microphone, ...) prompt, once per app.
 	//   "fine": power-user / red-team. Every connect()/device/mount is mediated

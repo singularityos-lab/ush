@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Mirko Brombin <brombin94@gmail.com>
 
 // Package tools manages bootstrap of tools required by ush runtime.
-// If the host system doesn't have apt/dpkg (e.g., Vanilla OS), downloads
+// If the host system doesn't have apt/dpkg, downloads
 // binaries from official Debian mirror and extracts them to ~/.local/share/ush/tools/.
 package tools
 

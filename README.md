@@ -24,7 +24,7 @@ It ships two profiles from the same binary:
 ## Architecture
 
 ```
-Host (Debian sid / Vanilla OS)
+Host (immutable Debian-based system)
   +- ush (no real root)
        +- user namespace   (guest uid maps to the host user)
        +- mount namespace  (overlay: host RO + layer upper)

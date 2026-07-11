@@ -346,10 +346,11 @@ func runParent(cfg *config.Config) error {
 	// by the child after it installs its notify filter.
 	var supervisor *security.Supervisor
 	{
-		xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
-		if xdgRuntime == "" {
-			xdgRuntime = filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
-		}
+		xdgRuntime := hostRuntimeDir()
+		// The seccomp socket (and the restart/dsh sentinels) live in the ush subdir,
+		// which is bind-mounted into the guest. Create it here on the host so the
+		// supervisor can bind its listener before the child dials.
+		_ = os.MkdirAll(filepath.Join(xdgRuntime, "ush"), 0o700)
 		sockPath := security.NotifSocketName(xdgRuntime, sess.ID)
 		os.Setenv("USH_NOTIF_SOCK", sockPath)
 		// Restart channel: the `restart` builtin drops this sentinel (the ush
@@ -557,6 +558,24 @@ func reexecSelf(profile string) error {
 // loadTrustedDevDirs reads the user-confirmed developer directories from the
 // broker's policy file. They are stored under ush storage, outside the guest's
 // view, so a compromised guest cannot self-grant. Returns nil if none/unreadable.
+// hostRuntimeDir returns the launching user's XDG runtime dir for host-side IPC
+// paths (the ush subdir, the seccomp-notify socket, the mount-helper socket).
+// In the reexec'd child we run as uid 0 inside the user namespace, so os.Getuid()
+// would yield /run/user/0; prefer XDG_RUNTIME_DIR, then USH_HOST_UID captured by
+// the parent before the reexec, and only then fall back to os.Getuid().
+func hostRuntimeDir() string {
+	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
+		return d
+	}
+	uid := os.Getuid()
+	if h := os.Getenv("USH_HOST_UID"); h != "" {
+		if hu, err := strconv.Atoi(h); err == nil {
+			uid = hu
+		}
+	}
+	return filepath.Join("/run/user", strconv.Itoa(uid))
+}
+
 // startBrokerDirect launches the ush-broker binary as a detached background process.
 // It is the fallback for hosts with no systemd user manager (e.g. sinit-based systems),
 // where `systemctl --user start` cannot bring the broker up. The broker is looked up on
@@ -619,10 +638,7 @@ func runGuestInit(cfg *config.Config) error {
 	if homeDir != "" {
 		os.Setenv("HOME", homeDir)
 	}
-	xdgRuntime := os.Getenv("XDG_RUNTIME_DIR")
-	if xdgRuntime == "" {
-		xdgRuntime = filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
-	}
+	xdgRuntime := hostRuntimeDir()
 
 	guestFS := &fs.GuestFS{
 		GuestRoot:      guestRoot,

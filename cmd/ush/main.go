@@ -413,12 +413,16 @@ func runParent(cfg *config.Config) error {
 			supervisor.SetEventSink(guardsink.New(sess.ID))
 			// Start handling notifications immediately (child may be blocked on execve).
 			go supervisor.Run()
-			// Ensure broker is running, then attach client.
-			// If not active, try to start it (best-effort - user may not have the unit).
+			// Ensure the broker is running, then attach the client. Prefer the
+			// systemd user unit when a user manager is present; otherwise spawn the
+			// binary directly so ush is self-sufficient on de-systemd hosts too. The
+			// broker binds a private AF_UNIX socket, so poll until it appears.
 			if !broker.IsAvailable() {
-				if err := exec.Command("systemctl", "--user", "start", "ush-broker").Run(); err == nil {
-					// Give it a moment to register on D-Bus.
-					time.Sleep(500 * time.Millisecond)
+				if err := exec.Command("systemctl", "--user", "start", "ush-broker").Run(); err != nil || !broker.IsAvailable() {
+					startBrokerDirect()
+				}
+				for i := 0; i < 20 && !broker.IsAvailable(); i++ {
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 			if broker.IsAvailable() {
@@ -553,6 +557,27 @@ func reexecSelf(profile string) error {
 // loadTrustedDevDirs reads the user-confirmed developer directories from the
 // broker's policy file. They are stored under ush storage, outside the guest's
 // view, so a compromised guest cannot self-grant. Returns nil if none/unreadable.
+// startBrokerDirect launches the ush-broker binary as a detached background process.
+// It is the fallback for hosts with no systemd user manager (e.g. sinit-based systems),
+// where `systemctl --user start` cannot bring the broker up. The broker is looked up on
+// PATH first, then next to this executable, so an install that ships both binaries in the
+// same directory works without PATH setup.
+func startBrokerDirect() {
+	path, err := exec.LookPath("ush-broker")
+	if err != nil {
+		self, e := os.Executable()
+		if e != nil {
+			return
+		}
+		path = filepath.Join(filepath.Dir(self), "ush-broker")
+	}
+	c := exec.Command(path)
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := c.Start(); err == nil && c.Process != nil {
+		_ = c.Process.Release()
+	}
+}
+
 func loadTrustedDevDirs(storageDir string) []string {
 	eng, err := policy.NewEngine(filepath.Join(storageDir, "policy.json"))
 	if err != nil {

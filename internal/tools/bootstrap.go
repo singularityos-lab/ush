@@ -16,12 +16,13 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	ushlog "github.com/singularityos-lab/ush/internal/log"
+	"github.com/ulikunitz/xz"
 )
 
 // httpClient with reasonable timeout to avoid hanging on slow mirrors.
@@ -318,39 +319,23 @@ func extractTar(name string, data []byte, destDir string) error {
 	case strings.HasSuffix(name, ".bz2"):
 		r = bzip2.NewReader(r)
 	case strings.HasSuffix(name, ".xz"):
-		// xz not in stdlib; use xz command if available.
-		return extractTarXZ(data, destDir)
+		// Decompress in-process: the target may be a minimal image (busybox tar has
+		// no --xz, no `xz` binary), and modern Debian packages ship data.tar.xz.
+		xr, err := xz.NewReader(r)
+		if err != nil {
+			return fmt.Errorf("xz reader: %w", err)
+		}
+		r = xr
 	case strings.HasSuffix(name, ".zst"):
-		return extractTarZst(data, destDir)
+		zr, err := zstd.NewReader(r)
+		if err != nil {
+			return fmt.Errorf("zstd reader: %w", err)
+		}
+		defer zr.Close()
+		r = zr
 	}
 
 	return extractTarReader(r, destDir)
-}
-
-func extractTarXZ(data []byte, destDir string) error {
-	xzCmd, err := exec.LookPath("xz")
-	if err != nil {
-		// Try tar directly (supports xz natively on GNU tar).
-		return extractTarWithCmd(data, destDir, "tar", "--xz")
-	}
-	_ = xzCmd
-	return extractTarWithCmd(data, destDir, "tar", "--xz")
-}
-
-func extractTarZst(data []byte, destDir string) error {
-	return extractTarWithCmd(data, destDir, "tar", "--zstd")
-}
-
-func extractTarWithCmd(data []byte, destDir string, tarBin string, extraFlag string) error {
-	args := []string{"-xf", "-", "-C", destDir}
-	if extraFlag != "" {
-		args = []string{extraFlag, "-xf", "-", "-C", destDir}
-	}
-	cmd := exec.Command(tarBin, args...)
-	cmd.Stdin = bytes.NewReader(data)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 func extractTarReader(r io.Reader, destDir string) error {

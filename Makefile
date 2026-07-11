@@ -6,11 +6,19 @@ SYSTEMD_DIR    := $(HOME)/.config/systemd/user
 VERSION        := 0.1.0
 LDFLAGS        := -X github.com/singularityos-lab/ush/internal/config.AppVersion=$(VERSION)
 
-.PHONY: all build build-ush build-broker install uninstall test redteam test-dsh clean fmt vet kill
+.PHONY: all build build-shim build-ush build-broker install uninstall test redteam test-dsh clean fmt vet kill
 
 all: build
 
-build: build-ush build-broker
+build: build-shim build-ush build-broker
+
+CC ?= cc
+SHIM_SRC := internal/preload/csrc/ush-chown-shim.c
+SHIM_SO  := internal/preload/ush-chown-shim.so
+
+build-shim:
+	@echo "-> build LD_PRELOAD shim"
+	@$(CC) -shared -fPIC -O2 -o $(SHIM_SO) $(SHIM_SRC)
 
 build-ush:
 	@echo "-> build ush"
@@ -27,6 +35,9 @@ install: build
 	@install -m 755 $(BINARY_BROKER) $(INSTALL_DIR)/$(BINARY_BROKER)
 	@echo "  link dsh (developer profile) to ush"
 	@ln -sf $(BINARY_USH) $(INSTALL_DIR)/dsh
+	@echo "  install prebuilt LD_PRELOAD shim to $(INSTALL_DIR)/../lib/ush"
+	@mkdir -p $(INSTALL_DIR)/../lib/ush
+	@install -m 644 $(SHIM_SO) $(INSTALL_DIR)/../lib/ush/ush-chown-shim.so
 	@echo "-> install systemd unit to $(SYSTEMD_DIR)"
 	@mkdir -p $(SYSTEMD_DIR)
 	@install -m 644 systemd/ush-broker.service $(SYSTEMD_DIR)/ush-broker.service

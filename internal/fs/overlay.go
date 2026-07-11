@@ -776,6 +776,12 @@ func (g *GuestFS) bindHome() error {
 		// Auto-injection files placed here only ever run INSIDE the guest.
 		_ = copyDirContents("/etc/skel", guestHome)
 	}
+	// The bind target must exist. When /var came in as an overlay the host's home
+	// path is already present, but on a tmpfs+bind /var (overlay unavailable) it is
+	// not, so create it unconditionally.
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("fs: guest home mountpoint: %w", err)
+	}
 	if err := bindMount(guestHome, dst, false); err != nil {
 		return fmt.Errorf("fs: bind guest home: %w", err)
 	}

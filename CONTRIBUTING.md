@@ -11,9 +11,10 @@ make build   # builds the LD_PRELOAD shim, ush and ush-broker
 make test
 ```
 
-`make build` compiles `internal/preload/ush-chown-shim.c` into the prebuilt shim
-that the package layer embeds, so run it (not a bare `go build`) after a fresh
-clone.
+`make build` builds `ush` and `ush-broker` with the version ldflag, so use it
+(not a bare `go build`) to get a correct version string. The `LD_PRELOAD` shim
+the package layer relies on is embedded as C source in `internal/preload` and
+compiled at runtime inside the guest, so it needs no separate build step.
 
 ## Ground rules
 

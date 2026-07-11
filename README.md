@@ -1,8 +1,8 @@
 # ush, a secure application runtime for Linux
 
-A harder-than-ChromeOS application environment, without `sudo`, `pkexec`, or
-traditional privilege elevators. Semantic-layer package management, a host-side
-permission broker, and a custom shell with security builtins.
+A locked-down environment for running desktop Linux applications without `sudo`,
+`pkexec`, or traditional privilege elevators. Semantic-layer package management, a
+host-side permission broker, and a custom shell with security builtins.
 
 ## Vision
 

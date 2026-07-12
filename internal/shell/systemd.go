@@ -42,11 +42,16 @@ func NewSystemdManager(cfg *SystemdConfig) *SystemdManager {
 func (sm *SystemdManager) Start() error {
 	// On de-systemd hosts (e.g. Sinty, sinit as PID1) there is no system systemd,
 	// so systemd --user has no manager to attach to: it execs, exits early, and
-	// wastes the readiness timeout on a doomed launch. bindRunSystemd only binds
-	// /run/systemd into the guest when the host is systemd-booted, so its absence
-	// here is a reliable sd_booted() proxy, so return a clean no-op instead.
-	if _, err := os.Stat("/run/systemd/system"); err != nil {
-		ushlog.Info("systemd: de-systemd host (no /run/systemd/system), skipping systemd --user")
+	// wastes the readiness timeout on a doomed launch. Gate on the system
+	// manager's private socket /run/systemd/private, not the /run/systemd/system
+	// directory: sinit lists that directory as a unit search path (and other
+	// tools can mkdir it) so its mere existence is not proof of a live manager,
+	// whereas the private socket is created only by a running systemd PID1.
+	// bindRunSystemd bind-mounts host /run/systemd (recursively) into the guest
+	// only when the host has it, so the socket's absence here is a reliable
+	// sd_booted() proxy, so return a clean no-op instead.
+	if _, err := os.Stat("/run/systemd/private"); err != nil {
+		ushlog.Info("systemd: no system manager (/run/systemd/private absent), skipping systemd --user")
 		return nil
 	}
 

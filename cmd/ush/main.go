@@ -335,6 +335,11 @@ func runParent(cfg *config.Config) error {
 	os.Setenv("USH_LOG_LEVEL", cfg.LogLevel)
 	os.Setenv("USH_HOST_UID", strconv.Itoa(os.Getuid()))
 	os.Setenv("USH_HOST_GID", strconv.Itoa(os.Getgid()))
+	// Pin the host runtime dir ONCE, from the real host session, and hand it to
+	// the guest via the environment. Every later hostRuntimeDir() call (parent
+	// supervisor bind AND guest-side dial/mount-helper) then agrees on the same
+	// path regardless of any XDG_RUNTIME_DIR reset after the userns reexec.
+	os.Setenv("USH_HOST_RUNTIME_DIR", hostRuntimeDir())
 
 	// Read host motd before pivot_root so it's available inside the guest.
 	if motd, err := os.ReadFile("/etc/ush/motd"); err == nil {
@@ -564,6 +569,15 @@ func reexecSelf(profile string) error {
 // would yield /run/user/0; prefer XDG_RUNTIME_DIR, then USH_HOST_UID captured by
 // the parent before the reexec, and only then fall back to os.Getuid().
 func hostRuntimeDir() string {
+	// USH_HOST_RUNTIME_DIR is the authoritative value the parent computed once
+	// (from the real host session) and exported before spawning the guest. It
+	// wins over XDG_RUNTIME_DIR, which the guest reexec may reset to the mapped
+	// uid's /run/user/0 -- reading that would put the host-side IPC sockets
+	// (seccomp supervisor, mount-helper) on a path the parent never binds,
+	// re-introducing the uid-mismatch hang the supervisor-socket fix removed.
+	if d := os.Getenv("USH_HOST_RUNTIME_DIR"); d != "" {
+		return d
+	}
 	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		return d
 	}

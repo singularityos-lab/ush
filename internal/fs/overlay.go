@@ -421,24 +421,50 @@ func ensureDebianSources(aptDir string) bool {
 	os.MkdirAll(aptDir, 0755) //nolint:errcheck
 	sourcesList := filepath.Join(aptDir, "sources.list")
 
-	// Check if a sources.list with valid deb entries already exists.
+	// The Debian archive keyring and gpgv are staged into the guest exec dir
+	// (blockPackageManagers), so [signed-by=...] lets apt authenticate InRelease.
+	const keyring = "/run/ush/exec/keyrings/debian-archive-keyring.gpg"
+
+	// Keep an existing sources.list ONLY if EVERY deb line is signature-verified
+	// against our staged keyring. Returning early on any `deb ` line (the old
+	// behaviour) let a pre-existing or attacker-planted
+	// `deb [trusted=yes] http://evil ...` survive and silently bypass signed-by,
+	// so apt would install unverified packages. Rewrite whenever anything is
+	// unsafe (trusted=yes / allow-insecure / missing our signed-by).
 	if data, err := os.ReadFile(sourcesList); err == nil {
+		sawDeb, allSafe := false, true
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "deb ") {
-				return false // sources.list valid, nothing to do
+			if !strings.HasPrefix(line, "deb ") && !strings.HasPrefix(line, "deb-src ") {
+				continue
 			}
+			sawDeb = true
+			opts := ""
+			if i := strings.Index(line, "["); i >= 0 {
+				if j := strings.Index(line[i:], "]"); j >= 0 {
+					opts = line[i : i+j+1]
+				}
+			}
+			unsafe := strings.Contains(opts, "trusted=yes") ||
+				strings.Contains(opts, "allow-insecure=yes") ||
+				strings.Contains(opts, "allow-downgrade-to-insecure=yes")
+			if unsafe || !strings.Contains(opts, "signed-by="+keyring) {
+				allSafe = false
+				break
+			}
+		}
+		if sawDeb && allSafe {
+			return false // already signature-verified against our keyring, keep
+		}
+		if sawDeb {
+			ushlog.Warn("fs: replacing unverified apt sources.list (trusted=yes or missing signed-by)")
 		}
 	}
 
-	// Create sources.list pointing to Debian stable, signature-verified.
-	// The Debian archive keyring and gpgv are staged into the guest exec dir
-	// (blockPackageManagers), so [signed-by=...] lets apt authenticate InRelease
-	// instead of the old [trusted=yes] which silently disabled verification.
+	// Create sources.list pointing to Debian bookworm, signature-verified.
 	// Pin bookworm so the suite matches the bootstrapped apt/gpgv and the staged
-	// debian-archive-keyring; "stable" now floats to trixie, whose signing key is
-	// absent from the bookworm keyring, which would fail verification.
-	const keyring = "/run/ush/exec/keyrings/debian-archive-keyring.gpg"
+	// keyring; "stable" now floats to trixie, whose signing key is absent from
+	// the bookworm keyring, which would fail verification.
 	content := "deb [signed-by=" + keyring + "] http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware\n" +
 		"deb [signed-by=" + keyring + "] http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware\n"
 	if err := os.WriteFile(sourcesList, []byte(content), 0644); err != nil {

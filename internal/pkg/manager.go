@@ -226,7 +226,18 @@ func (m *Manager) update(ctx context.Context, stdout, stderr io.Writer, skipPerm
 		}
 	}
 	fmt.Fprintln(stdout, "pkg: updating package lists...")
-	return m.runApt(ctx, stdout, stderr, "-o", "APT::Sandbox::User=root", "update")
+	args := []string{"-o", "APT::Sandbox::User=root"}
+	// apt's pkgInitSystem needs a valid dpkg status file to initialize the
+	// debian packaging system; without it `update` fails with "Unable to
+	// determine a suitable packaging system type" while `install` (which sets
+	// this) works. Point it at the pkgroot admindir like install does.
+	if m.pkgPrefix != "" {
+		if adminDir, err := ensurePkgAdminDir(m.pkgPrefix); err == nil {
+			args = append(args, "-o", fmt.Sprintf("Dir::State::status=%s/status", adminDir))
+		}
+	}
+	args = append(args, "update")
+	return m.runApt(ctx, stdout, stderr, args...)
 }
 
 // aptListsEmpty returns true if apt lists are absent or empty.
@@ -682,9 +693,15 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// guest-staged copy so `dpkg --print-architecture` works and apt can
 		// determine the packaging system on the non-Debian guest.
 		env = append(env, "DPKG_DATADIR="+guestExec+"/share/dpkg")
+		// Prepend the guest exec dir to PATH so dpkg finds its staged helpers
+		// (dpkg-deb, dpkg-split) and the no-op ldconfig stub during configure.
+		env = append(env, "PATH="+guestExec+":"+os.Getenv("PATH"))
 
-		toolsBin := filepath.Join(toolsDir, "usr", "bin")
-		dpkgPath := toolsBin + ":/usr/sbin:/usr/bin:/sbin:/bin"
+		// runApt executes INSIDE the namespace, where toolsDir is not visible (ush
+		// write-isolates it); the real apt/dpkg tools are bind-staged at
+		// /run/ush/exec. Reference those guest paths, or the -o overrides that probe
+		// toolsDir silently drop and apt/dpkg fall back to absent /usr paths.
+		dpkgPath := guestExec + ":/usr/sbin:/usr/bin:/sbin:/bin"
 		if hookDir != "" {
 			dpkgPath = hookDir + ":" + dpkgPath
 		}
@@ -697,26 +714,52 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// only fetches amd64 packages, so pin it explicitly.
 		extraArgs = append(extraArgs, "-o", "APT::Architecture=amd64")
 
-		// Only point apt to bootstrapped dpkg if it actually exists there.
-		bootDpkg := filepath.Join(toolsDir, "usr", "bin", "dpkg")
-		if _, err := os.Stat(bootDpkg); err == nil {
-			extraArgs = append(extraArgs,
-				"-o", "Dir::Bin::dpkg="+bootDpkg,
-			)
+		// libapt-pkg reads the arch tables from the hard-coded /usr/share/dpkg,
+		// which does not exist on the non-Debian guest -> "Error reading the CPU
+		// table". Point apt straight at the staged tables so it never needs that
+		// path (nor a working dpkg) just to determine the architecture.
+		dpkgData := guestExec + "/share/dpkg"
+		extraArgs = append(extraArgs,
+			"-o", "Dir::dpkg::cputable="+dpkgData+"/cputable",
+			"-o", "Dir::dpkg::tupletable="+dpkgData+"/tupletable",
+			"-o", "Dir::dpkg::triplettable="+dpkgData+"/tupletable",
+		)
+
+		// The guest's /var/lib is read-only and has no /var/lib/apt, so apt cannot
+		// create its lists/archives there ("List directory .../partial is missing").
+		// Redirect apt's state and cache to a writable path under the ush home and
+		// pre-create the partial dirs apt downloads into.
+		aptState := filepath.Join(filepath.Dir(toolsDir), "apt-state")
+		os.MkdirAll(filepath.Join(aptState, "lists", "partial"), 0755)    //nolint:errcheck
+		os.MkdirAll(filepath.Join(aptState, "archives", "partial"), 0755) //nolint:errcheck
+		os.MkdirAll(filepath.Join(aptState, "log"), 0755)                 //nolint:errcheck
+		os.MkdirAll(filepath.Join(aptState, "cache"), 0755)               //nolint:errcheck
+		// Point apt's whole state/cache/log tree at the writable dir: besides the
+		// lists, apt also writes extended_states (Dir::State) and term/eipp logs
+		// (Dir::Log), both of which live under the read-only /var on the guest.
+		extraArgs = append(extraArgs,
+			"-o", "Dir::State="+aptState,
+			"-o", "Dir::State::lists="+filepath.Join(aptState, "lists"),
+			"-o", "Dir::Cache="+filepath.Join(aptState, "cache"),
+			"-o", "Dir::Cache::archives="+filepath.Join(aptState, "archives"),
+			"-o", "Dir::Log="+filepath.Join(aptState, "log"),
+		)
+
+		// Point apt at the guest-staged dpkg (blockPackageManagers copies it to
+		// /run/ush/exec). Probe the guest path, not toolsDir.
+		if _, err := os.Stat(guestExec + "/dpkg"); err == nil {
+			extraArgs = append(extraArgs, "-o", "Dir::Bin::dpkg="+guestExec+"/dpkg")
 		}
-		bootDpkgDeb := filepath.Join(toolsDir, "usr", "bin", "dpkg-deb")
-		if _, err := os.Stat(bootDpkgDeb); err == nil {
-			extraArgs = append(extraArgs,
-				"-o", "Dir::Bin::dpkg-deb="+bootDpkgDeb,
-			)
+		if _, err := os.Stat(guestExec + "/dpkg-deb"); err == nil {
+			extraArgs = append(extraArgs, "-o", "Dir::Bin::dpkg-deb="+guestExec+"/dpkg-deb")
 		}
 		extraArgs = append(extraArgs, "-o", "Dpkg::Path="+dpkgPath)
 
-		// Only override methods dir if the bootstrapped methods exist.
-		// Otherwise, fall back to the system methods (which are bind-mounted RO).
-		bootMethods := filepath.Join(toolsDir, "usr", "lib", "apt", "methods")
-		if _, err := os.Stat(filepath.Join(bootMethods, "http")); err == nil {
-			extraArgs = append([]string{"-o", "Dir::Bin::Methods=" + bootMethods}, extraArgs...)
+		// Point apt at the guest-staged method drivers (/run/ush/exec/apt-methods).
+		// Probe the GUEST path: runApt runs in the namespace where toolsDir is not
+		// visible, so a toolsDir stat fails and apt looks in absent /usr/lib/apt/methods.
+		if _, err := os.Stat(guestExec + "/apt-methods/http"); err == nil {
+			extraArgs = append([]string{"-o", "Dir::Bin::methods=" + guestExec + "/apt-methods"}, extraArgs...)
 		}
 
 		args = append(extraArgs, args...)
@@ -727,6 +770,7 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 	// pipes so the PTY buys us nothing.
 	args = append([]string{"-o", "Dpkg::Use-Pty=0"}, args...)
 
+	ushlog.Debug("pkg: apt-get final", "bootstrapped", isBootstrapped, "args", args)
 	cmd := exec.CommandContext(ctx, aptBin, args...)
 	// Detach from the interactive terminal stdin so maintainer scripts that
 	// read from stdin (despite DEBIAN_FRONTEND=noninteractive) get EOF

@@ -53,6 +53,12 @@ var requiredPackages = []pkgSpec{
 	// real Debian libsystemd0 so libapt-pkg (which needs sd_bus_open_system)
 	// resolves against it via the guest-leading LD_LIBRARY_PATH.
 	{name: "libsystemd0", poolPath: "pool/main/s/systemd"},
+	{name: "libmd0", poolPath: "pool/main/libm/libmd"},
+	{name: "libselinux1", poolPath: "pool/main/libs/libselinux"},
+	// GNU tar: dpkg-deb invokes `tar --warning=no-timestamp` which the guest's
+	// BusyBox tar rejects; ship the real one and stage it ahead of BusyBox in PATH.
+	{name: "tar", poolPath: "pool/main/t/tar"},
+	{name: "libacl1", poolPath: "pool/main/a/acl"},
 }
 
 type pkgSpec struct {
@@ -129,8 +135,13 @@ func EnsureApt() error {
 
 	var failed []string
 	for _, pkg := range requiredPackages {
-		// Skip if already present.
-		if findBin(pkg.name) != "" {
+		// Skip only if already extracted into the tools dir. Do NOT skip on a
+		// same-named system binary: the guest's BusyBox tar is not a substitute
+		// for GNU tar, and matching it here silently left tar un-bootstrapped.
+		if _, err := os.Stat(filepath.Join(toolsDir, "usr", "bin", pkg.name)); err == nil {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(toolsDir, "bin", pkg.name)); err == nil {
 			continue
 		}
 		url, err := findPackageURL(pkgIndex, pkg.name)

@@ -40,6 +40,16 @@ func NewSystemdManager(cfg *SystemdConfig) *SystemdManager {
 
 // Start starts systemd --user in the guest.
 func (sm *SystemdManager) Start() error {
+	// On de-systemd hosts (e.g. Sinty, sinit as PID1) there is no system systemd,
+	// so systemd --user has no manager to attach to: it execs, exits early, and
+	// wastes the readiness timeout on a doomed launch. bindRunSystemd only binds
+	// /run/systemd into the guest when the host is systemd-booted, so its absence
+	// here is a reliable sd_booted() proxy, so return a clean no-op instead.
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		ushlog.Info("systemd: de-systemd host (no /run/systemd/system), skipping systemd --user")
+		return nil
+	}
+
 	if err := sm.prepareEnvironment(); err != nil {
 		return fmt.Errorf("systemd: prepare env: %w", err)
 	}

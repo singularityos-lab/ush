@@ -1294,7 +1294,16 @@ func (g *GuestFS) blockPackageManagers() error {
 				filepath.Join(g.ToolsDir, "bin"),
 			}, searchPaths...)
 		}
-		for _, bin := range blockedBins {
+		// dpkg's unpack/query helpers are not blocked, but dpkg execs them by name,
+		// so they must be staged alongside it in the guest-visible /run/ush/exec
+		// (Dpkg::Path points here). Without dpkg-deb, apt install cannot unpack.
+		stageBins := append([]string{}, blockedBins...)
+		// dpkg helpers + maintainer-script tools (preinst/postinst call these by
+		// name via PATH) + GNU tar for dpkg-deb's unpack.
+		stageBins = append(stageBins,
+			"dpkg-deb", "dpkg-split", "dpkg-query", "dpkg-trigger",
+			"dpkg-divert", "update-alternatives", "dpkg-maintscript-helper", "tar")
+		for _, bin := range stageBins {
 			for _, dir := range searchPaths {
 				src := filepath.Join(dir, bin)
 				if data, err := os.ReadFile(src); err == nil {
@@ -1332,9 +1341,40 @@ func (g *GuestFS) blockPackageManagers() error {
 			// packaging system type" on a non-Debian guest that has no /usr/share/dpkg.
 			// DPKG_DATADIR is pointed at /run/ush/exec/share/dpkg by the pkg manager.
 			if fi, err := os.Stat(filepath.Join(g.ToolsDir, "usr", "share", "dpkg")); err == nil && fi.IsDir() {
+				dpkgData := filepath.Join(g.ToolsDir, "usr", "share", "dpkg")
 				ddst := filepath.Join(ushExecHost, "share", "dpkg")
 				os.MkdirAll(ddst, 0755)
-				copyDirContents(filepath.Join(g.ToolsDir, "usr", "share", "dpkg"), ddst) //nolint:errcheck
+				copyDirContents(dpkgData, ddst) //nolint:errcheck
+				// Also place them at the compiled-in default /usr/share/dpkg inside
+				// the guest: apt runs dpkg with a sanitized environment, so the
+				// DPKG_DATADIR override is not always honored and dpkg falls back to
+				// this path when reading the CPU/tuple tables.
+				guestDpkgData := filepath.Join(g.GuestRoot, "usr", "share", "dpkg")
+				if err := os.MkdirAll(guestDpkgData, 0755); err == nil {
+					copyDirContents(dpkgData, guestDpkgData) //nolint:errcheck
+				} else {
+					ushlog.Warn("fs: unable to stage dpkg data at guest /usr/share/dpkg", "err", err)
+				}
+			}
+
+			// Stage apt's method drivers (http/gpgv/...) into a guest-visible path.
+			// The toolsDir is not reachable from inside the namespace, so apt
+			// otherwise reports "The method driver /usr/lib/apt/methods/http could
+			// not be found". The pkg manager points Dir::Bin::Methods here.
+			if fi, err := os.Stat(filepath.Join(g.ToolsDir, "usr", "lib", "apt", "methods")); err == nil && fi.IsDir() {
+				mdst := filepath.Join(ushExecHost, "apt-methods")
+				os.MkdirAll(mdst, 0755)
+				copyDirContents(filepath.Join(g.ToolsDir, "usr", "lib", "apt", "methods"), mdst) //nolint:errcheck
+			}
+
+			// Sinty ships no ldconfig (it uses a prebuilt ld.so.cache), but dpkg
+			// aborts configure with "expected program not found" when ldconfig is
+			// missing from PATH. ush resolves guest libraries via pkgroot binds and
+			// LD_LIBRARY_PATH, not the global cache, so a no-op ldconfig is correct
+			// here; stage it in the guest-visible exec dir (added to dpkg's PATH).
+			ldstub := filepath.Join(ushExecHost, "ldconfig")
+			if err := os.WriteFile(ldstub, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+				ushlog.Warn("fs: unable to stage ldconfig stub", "err", err)
 			}
 		}
 

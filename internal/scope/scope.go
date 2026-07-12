@@ -37,13 +37,18 @@ func Reexec(slug string) error {
 	if err != nil {
 		return nil // no systemd-run: run unscoped
 	}
-	// systemd-run --user needs the user bus; without it the exec would replace
-	// ush with a doomed systemd-run, so bail out to unscoped instead.
+	// systemd-run --user needs a running systemd user manager, not merely a
+	// session bus: its private socket at $XDG_RUNTIME_DIR/systemd/private is the
+	// signal that `systemctl --user` can work. On de-systemd systems (e.g. Sinty)
+	// a session D-Bus exists at $XDG_RUNTIME_DIR/bus but no user manager does, so
+	// checking the bus alone let the exec replace ush with a doomed systemd-run
+	// that dies with "Failed to connect to user scope bus". Gate on the manager
+	// socket so those systems bail out to unscoped instead.
 	xdg := os.Getenv("XDG_RUNTIME_DIR")
 	if xdg == "" {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(xdg, "bus")); err != nil {
+	if _, err := os.Stat(filepath.Join(xdg, "systemd", "private")); err != nil {
 		return nil
 	}
 	self, err := os.Executable()

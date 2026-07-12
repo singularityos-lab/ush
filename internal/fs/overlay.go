@@ -431,11 +431,16 @@ func ensureDebianSources(aptDir string) bool {
 		}
 	}
 
-	// Create sources.list pointing to Debian stable.
-	// [trusted=yes] bypasses GPG verification: the guest doesn't have the Debian keyring
-	// and apt-key might not be available in the namespace.
-	content := "deb [trusted=yes] http://deb.debian.org/debian/ stable main contrib non-free non-free-firmware\n" +
-		"deb [trusted=yes] http://security.debian.org/debian-security stable-security main contrib non-free non-free-firmware\n"
+	// Create sources.list pointing to Debian stable, signature-verified.
+	// The Debian archive keyring and gpgv are staged into the guest exec dir
+	// (blockPackageManagers), so [signed-by=...] lets apt authenticate InRelease
+	// instead of the old [trusted=yes] which silently disabled verification.
+	// Pin bookworm so the suite matches the bootstrapped apt/gpgv and the staged
+	// debian-archive-keyring; "stable" now floats to trixie, whose signing key is
+	// absent from the bookworm keyring, which would fail verification.
+	const keyring = "/run/ush/exec/keyrings/debian-archive-keyring.gpg"
+	content := "deb [signed-by=" + keyring + "] http://deb.debian.org/debian/ bookworm main contrib non-free non-free-firmware\n" +
+		"deb [signed-by=" + keyring + "] http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware\n"
 	if err := os.WriteFile(sourcesList, []byte(content), 0644); err != nil {
 		ushlog.Warn("fs: unable to create Debian sources.list", "err", err)
 		return false
@@ -1302,7 +1307,8 @@ func (g *GuestFS) blockPackageManagers() error {
 		// name via PATH) + GNU tar for dpkg-deb's unpack.
 		stageBins = append(stageBins,
 			"dpkg-deb", "dpkg-split", "dpkg-query", "dpkg-trigger",
-			"dpkg-divert", "update-alternatives", "dpkg-maintscript-helper", "tar")
+			"dpkg-divert", "update-alternatives", "dpkg-maintscript-helper", "tar",
+			"gpgv", "apt-key") // signature verification of the apt release files
 		for _, bin := range stageBins {
 			for _, dir := range searchPaths {
 				src := filepath.Join(dir, bin)
@@ -1375,6 +1381,21 @@ func (g *GuestFS) blockPackageManagers() error {
 			ldstub := filepath.Join(ushExecHost, "ldconfig")
 			if err := os.WriteFile(ldstub, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 				ushlog.Warn("fs: unable to stage ldconfig stub", "err", err)
+			}
+
+			// Stage the Debian archive keyring so apt can verify InRelease with the
+			// staged gpgv; the guest sources.list references it via [signed-by=...].
+			if g.ToolsDir != "" {
+				keySrc := filepath.Join(g.ToolsDir, "usr", "share", "keyrings", "debian-archive-keyring.gpg")
+				if data, err := os.ReadFile(keySrc); err == nil {
+					kdst := filepath.Join(ushExecHost, "keyrings")
+					os.MkdirAll(kdst, 0755)
+					if werr := os.WriteFile(filepath.Join(kdst, "debian-archive-keyring.gpg"), data, 0644); werr != nil {
+						ushlog.Warn("fs: unable to stage debian archive keyring", "err", werr)
+					}
+				} else {
+					ushlog.Warn("fs: debian archive keyring not found in tools", "err", err)
+				}
 			}
 		}
 

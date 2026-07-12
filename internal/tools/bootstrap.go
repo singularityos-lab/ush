@@ -59,6 +59,10 @@ var requiredPackages = []pkgSpec{
 	// BusyBox tar rejects; ship the real one and stage it ahead of BusyBox in PATH.
 	{name: "tar", poolPath: "pool/main/t/tar"},
 	{name: "libacl1", poolPath: "pool/main/a/acl"},
+	// Signature verification: gpgv binary + the Debian archive keyring, so apt
+	// authenticates InRelease instead of installing unverified indices.
+	{name: "gpgv", poolPath: "pool/main/g/gpgv"},
+	{name: "debian-archive-keyring", poolPath: "pool/main/d/debian-archive-keyring"},
 }
 
 type pkgSpec struct {

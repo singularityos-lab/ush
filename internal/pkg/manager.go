@@ -714,6 +714,19 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// only fetches amd64 packages, so pin it explicitly.
 		extraArgs = append(extraArgs, "-o", "APT::Architecture=amd64")
 
+		// Verify signatures via the staged gpgv + [signed-by=] keyring only.
+		// Disable the legacy trusted.gpg / trusted.gpg.d path, which makes apt
+		// shell out to the (absent) /usr/bin/apt-key and fail the whole update.
+		extraArgs = append(extraArgs,
+			"-o", "Dir::Etc::trusted=/dev/null",
+			"-o", "Dir::Etc::trustedparts=/dev/null",
+			// apt 2.6 still shells out to apt-key at a hard-coded /usr/bin path for
+			// the clearsigned InRelease check; point it at the staged copy so it can
+			// run (it in turn calls the staged gpgv against the [signed-by] keyring).
+			"-o", "Dir::Bin::apt-key="+guestExec+"/apt-key",
+			"-o", "APT::Key::gpgvcommand="+guestExec+"/gpgv",
+		)
+
 		// libapt-pkg reads the arch tables from the hard-coded /usr/share/dpkg,
 		// which does not exist on the non-Debian guest -> "Error reading the CPU
 		// table". Point apt straight at the staged tables so it never needs that

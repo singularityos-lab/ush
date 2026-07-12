@@ -1309,17 +1309,32 @@ func (g *GuestFS) blockPackageManagers() error {
 			}
 		}
 
-		// If ToolsDir contains libs (needed for dynamic apt), bind-mount
-		// them to an accessible location for ld.so.
+		// If ToolsDir contains libs (needed for dynamic apt), stage them into
+		// ush-exec/lib so ld.so finds them at the guest-visible /run/ush/exec/lib.
+		// Copy EVERY lib dir, not just the first: the apt-get binary links against
+		// libapt-private.so.0.0 which lives only in usr/lib/x86_64-linux-gnu, while
+		// the earlier-matching usr/lib holds just the apt/dpkg method dirs. Breaking
+		// on the first match left libapt-private out and apt-get died with
+		// "error while loading shared libraries: libapt-private.so.0.0".
 		if g.ToolsDir != "" {
-			for _, libDir := range []string{"usr/lib", "lib", "lib/x86_64-linux-gnu", "usr/lib/x86_64-linux-gnu"} {
+			dst := filepath.Join(ushExecHost, "lib")
+			os.MkdirAll(dst, 0755)
+			for _, libDir := range []string{"usr/lib", "usr/lib/x86_64-linux-gnu", "lib", "lib/x86_64-linux-gnu"} {
 				src := filepath.Join(g.ToolsDir, libDir)
 				if fi, err := os.Stat(src); err == nil && fi.IsDir() {
-					dst := filepath.Join(ushExecHost, "lib")
-					os.MkdirAll(dst, 0755)
 					copyDirContents(src, dst) //nolint:errcheck
-					break
 				}
+			}
+
+			// Stage dpkg's data tables (cputable/tupletable/abitable/ostable) so the
+			// bootstrapped dpkg can print the architecture. Without them apt fails
+			// with "Error reading the CPU table" / "Unable to determine a suitable
+			// packaging system type" on a non-Debian guest that has no /usr/share/dpkg.
+			// DPKG_DATADIR is pointed at /run/ush/exec/share/dpkg by the pkg manager.
+			if fi, err := os.Stat(filepath.Join(g.ToolsDir, "usr", "share", "dpkg")); err == nil && fi.IsDir() {
+				ddst := filepath.Join(ushExecHost, "share", "dpkg")
+				os.MkdirAll(ddst, 0755)
+				copyDirContents(filepath.Join(g.ToolsDir, "usr", "share", "dpkg"), ddst) //nolint:errcheck
 			}
 		}
 

@@ -665,14 +665,23 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 	toolsDir := os.Getenv("USH_TOOLS_DIR")
 	isBootstrapped := toolsDir != "" && (strings.HasPrefix(aptBin, toolsDir) || aptBin == "/run/ush/exec/apt-get")
 	if isBootstrapped {
+		// apt-get runs inside the guest namespace, where the staged libs are
+		// bind-mounted at /run/ush/exec/lib (blockPackageManagers). The host
+		// toolsDir path is not visible there, so the guest path must lead.
+		const guestExec = "/run/ush/exec"
+		guestLib := guestExec + "/lib"
 		toolsLib := filepath.Join(toolsDir, "usr", "lib", "x86_64-linux-gnu")
 		toolsLib2 := filepath.Join(toolsDir, "usr", "lib")
 		existing := os.Getenv("LD_LIBRARY_PATH")
-		ldPath := toolsLib + ":" + toolsLib2
+		ldPath := guestLib + ":" + guestLib + "/x86_64-linux-gnu:" + toolsLib + ":" + toolsLib2
 		if existing != "" {
 			ldPath += ":" + existing
 		}
 		env = append(env, "LD_LIBRARY_PATH="+ldPath)
+		// dpkg reads its architecture tables from DPKG_DATADIR; point it at the
+		// guest-staged copy so `dpkg --print-architecture` works and apt can
+		// determine the packaging system on the non-Debian guest.
+		env = append(env, "DPKG_DATADIR="+guestExec+"/share/dpkg")
 
 		toolsBin := filepath.Join(toolsDir, "usr", "bin")
 		dpkgPath := toolsBin + ":/usr/sbin:/usr/bin:/sbin:/bin"
@@ -681,6 +690,12 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		}
 
 		extraArgs := []string{}
+
+		// The guest is not Debian, so apt cannot infer the arch from the base
+		// system: without this it fails with "Unable to determine a suitable
+		// packaging system type" / "Error reading the CPU table". The bootstrap
+		// only fetches amd64 packages, so pin it explicitly.
+		extraArgs = append(extraArgs, "-o", "APT::Architecture=amd64")
 
 		// Only point apt to bootstrapped dpkg if it actually exists there.
 		bootDpkg := filepath.Join(toolsDir, "usr", "bin", "dpkg")

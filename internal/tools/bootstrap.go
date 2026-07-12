@@ -47,6 +47,12 @@ var requiredPackages = []pkgSpec{
 	{name: "liblz4-1", poolPath: "pool/main/l/lz4"},
 	{name: "libzstd1", poolPath: "pool/main/z/zstd"},
 	{name: "liblzma5", poolPath: "pool/main/x/xz-utils"},
+	{name: "libbz2-1.0", poolPath: "pool/main/b/bzip2"},
+	{name: "libxxhash0", poolPath: "pool/main/x/xxhash"},
+	// Sinty ships a partial libsystemd shim without sd_bus_* symbols; stage the
+	// real Debian libsystemd0 so libapt-pkg (which needs sd_bus_open_system)
+	// resolves against it via the guest-leading LD_LIBRARY_PATH.
+	{name: "libsystemd0", poolPath: "pool/main/s/systemd"},
 }
 
 type pkgSpec struct {

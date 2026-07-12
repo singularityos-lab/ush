@@ -165,6 +165,11 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 				"-o", "Dpkg::Options::=--force-script-chrootless",
 				"-o", "Dpkg::Options::=--no-triggers",
 				"-o", "Dpkg::Options::=--force-depends",
+				// In the dsh (dev) profile the caller keeps its real uid instead of
+				// mapping to 0, so dpkg's superuser check would abort the install.
+				// instdir/admindir already point at a user-writable pkgroot, so let
+				// dpkg proceed unprivileged; ignored (harmless) when already root.
+				"-o", "Dpkg::Options::=--force-not-root",
 				"-o", "Dpkg::Options::=--path-exclude=/usr/share/man/*",
 				"-o", "Dpkg::Options::=--path-exclude=/usr/share/doc/*",
 				// Prevent core glibc runtime from being installed into pkgroot.

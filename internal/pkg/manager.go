@@ -725,6 +725,10 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		extraArgs = append(extraArgs,
 			"-o", "Dir::Etc::trusted=/dev/null",
 			"-o", "Dir::Etc::trustedparts=/dev/null",
+			// Ignore sources.list.d entirely: apt reads only our verified
+			// sources.list, so a leftover/planted *.list or *.sources deb822 file
+			// cannot add an unauthenticated repo.
+			"-o", "Dir::Etc::sourceparts=/dev/null",
 			// apt 2.6 still shells out to apt-key at a hard-coded /usr/bin path for
 			// the clearsigned InRelease check; point it at the staged copy so it can
 			// run (it in turn calls the staged gpgv against the [signed-by] keyring).

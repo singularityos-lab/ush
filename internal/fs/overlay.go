@@ -425,12 +425,29 @@ func ensureDebianSources(aptDir string) bool {
 	// (blockPackageManagers), so [signed-by=...] lets apt authenticate InRelease.
 	const keyring = "/run/ush/exec/keyrings/debian-archive-keyring.gpg"
 
-	// Keep an existing sources.list ONLY if EVERY deb line is signature-verified
+	// ALWAYS purge sources.list.d first, before any early return. apt reads every
+	// *.list and *.sources (deb822) file there, so an attacker-planted
+	// evil.sources would bypass whatever we enforce on sources.list. The pkg
+	// manager also passes Dir::Etc::sourceparts=/dev/null as defence-in-depth.
+	changed := false
+	sourcesD := filepath.Join(aptDir, "sources.list.d")
+	if entries, err := os.ReadDir(sourcesD); err == nil {
+		for _, e := range entries {
+			if err := os.Remove(filepath.Join(sourcesD, e.Name())); err == nil {
+				changed = true
+			}
+		}
+		if changed {
+			ushlog.Info("fs: sources.list.d purged (extra/host repos removed)")
+		}
+	}
+
+	// Keep an existing sources.list ONLY if EVERY deb/deb-src line is verified
 	// against our staged keyring. Returning early on any `deb ` line (the old
 	// behaviour) let a pre-existing or attacker-planted
-	// `deb [trusted=yes] http://evil ...` survive and silently bypass signed-by,
-	// so apt would install unverified packages. Rewrite whenever anything is
-	// unsafe (trusted=yes / allow-insecure / missing our signed-by).
+	// `deb [trusted=yes] http://evil ...` survive and silently bypass signed-by.
+	// Parse options case-insensitively and whitespace-tolerantly so a crafted
+	// `[signed-by=<ours> Trusted=yes]` or `[ trusted=yes ]` cannot slip past.
 	if data, err := os.ReadFile(sourcesList); err == nil {
 		sawDeb, allSafe := false, true
 		for _, line := range strings.Split(string(data), "\n") {
@@ -445,16 +462,18 @@ func ensureDebianSources(aptDir string) bool {
 					opts = line[i : i+j+1]
 				}
 			}
-			unsafe := strings.Contains(opts, "trusted=yes") ||
-				strings.Contains(opts, "allow-insecure=yes") ||
-				strings.Contains(opts, "allow-downgrade-to-insecure=yes")
+			low := strings.ToLower(strings.ReplaceAll(opts, " ", ""))
+			unsafe := strings.Contains(low, "trusted=yes") ||
+				strings.Contains(low, "allow-insecure=yes") ||
+				strings.Contains(low, "allow-downgrade-to-insecure=yes")
+			// signed-by path is case-sensitive (a filesystem path).
 			if unsafe || !strings.Contains(opts, "signed-by="+keyring) {
 				allSafe = false
 				break
 			}
 		}
 		if sawDeb && allSafe {
-			return false // already signature-verified against our keyring, keep
+			return changed // already signature-verified against our keyring, keep
 		}
 		if sawDeb {
 			ushlog.Warn("fs: replacing unverified apt sources.list (trusted=yes or missing signed-by)")
@@ -469,19 +488,9 @@ func ensureDebianSources(aptDir string) bool {
 		"deb [signed-by=" + keyring + "] http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware\n"
 	if err := os.WriteFile(sourcesList, []byte(content), 0644); err != nil {
 		ushlog.Warn("fs: unable to create Debian sources.list", "err", err)
-		return false
+		return changed
 	}
 	ushlog.Info("fs: Debian sources.list created (non-Debian system detected)")
-
-	// Remove sources.list.d to avoid host repos (e.g. third-party PPAs).
-	sourcesD := filepath.Join(aptDir, "sources.list.d")
-	if entries, err := os.ReadDir(sourcesD); err == nil {
-		for _, e := range entries {
-			os.Remove(filepath.Join(sourcesD, e.Name())) //nolint:errcheck
-		}
-		ushlog.Info("fs: sources.list.d purged (host repos removed)")
-	}
-
 	return true
 }
 

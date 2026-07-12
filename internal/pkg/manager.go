@@ -363,7 +363,7 @@ func (m *Manager) fixDirectDpkg(ctx context.Context, stdout, stderr io.Writer) e
 		pathValue = hookDir + ":" + pathValue
 	}
 
-	env := append(os.Environ(),
+	env := append(cleanAptEnv(),
 		"DEBIAN_FRONTEND=noninteractive",
 		"DEBCONF_NONINTERACTIVE_SEEN=true",
 		"DPKG_ROOT=",
@@ -571,10 +571,14 @@ func (m *Manager) checkMaintainerScripts(ctx context.Context, stdout, stderr io.
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// apt-get download. Apply the same security hardening as runApt so this
-	// pre-check cannot fetch from an unauthenticated sources.list.d repo.
+	// apt-get download. Apply the same security hardening as runApt (flags AND a
+	// clean env) so this pre-check cannot fetch from an unauthenticated repo via
+	// sources.list.d or an injected APT_CONFIG.
 	dlArgs := append(aptSecurityFlags(), "download", pkg)
-	dlOut, dlErr := runCmdOutput("apt-get", dlArgs...)
+	dlCmd := exec.Command("apt-get", dlArgs...)
+	dlCmd.Env = cleanAptEnv()
+	dlOutBytes, dlErr := dlCmd.Output()
+	dlOut := string(dlOutBytes)
 	if dlErr != nil {
 		ushlog.Debug("pkg: download pre-check failed", "pkg", pkg, "err", dlErr, "out", dlOut)
 		return nil
@@ -635,7 +639,26 @@ func aptSecurityFlags() []string {
 		"-o", "Dir::Etc::trusted=/dev/null",
 		"-o", "Dir::Etc::trustedparts=/dev/null",
 		"-o", "Dir::Etc::sourceparts=/dev/null",
+		// Pin the source list too: a command-line -o outranks any apt.conf.d or
+		// APT_CONFIG file, so apt reads only our verified sources.list even if
+		// something tries to redirect Dir::Etc::sourcelist elsewhere.
+		"-o", "Dir::Etc::sourcelist=/etc/apt/sources.list",
 	}
+}
+
+// cleanAptEnv returns the current environment with APT_CONFIG removed. A
+// caller-supplied APT_CONFIG points apt at an arbitrary config file that can
+// redefine Dir::Etc::sourcelist, the keyring, or the gpgv command and thereby
+// bypass signature enforcement; strip it from every apt invocation.
+func cleanAptEnv() []string {
+	out := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "APT_CONFIG=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // runApt executes apt-get inside the guest with security flags.
@@ -667,7 +690,7 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		pathValue = hookDir + ":" + pathValue
 	}
 
-	env := append(os.Environ(),
+	env := append(cleanAptEnv(),
 		"DEBIAN_FRONTEND=noninteractive",
 		"DEBCONF_NONINTERACTIVE_SEEN=true",
 		"APT_LISTCHANGES_FRONTEND=none",

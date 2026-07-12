@@ -43,6 +43,10 @@ func TestEnsureDebianSourcesRejectsCraftedTrusted(t *testing.T) {
 		// signed-by is a comma-separated list: an appended attacker keyring must
 		// NOT be accepted just because ours is present.
 		"deb [signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg,/tmp/evil.gpg] http://evil.example/d bookworm main\n",
+		// duplicated signed-by (apt honours both); the second (mixed-case) evil
+		// keyring must trip the "exactly one" rule.
+		"deb [signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg Signed-By=/tmp/evil.gpg] http://evil.example/d bookworm main\n",
+		"deb [signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg signed-by=/tmp/evil.gpg] http://evil.example/d bookworm main\n",
 	} {
 		dir := t.TempDir()
 		sl := filepath.Join(dir, "sources.list")

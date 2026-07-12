@@ -473,16 +473,19 @@ func ensureDebianSources(aptDir string) bool {
 			unsafe := strings.Contains(low, "trusted=yes") ||
 				strings.Contains(low, "allow-insecure=yes") ||
 				strings.Contains(low, "allow-downgrade-to-insecure=yes")
-			// signed-by must be EXACTLY our keyring. apt treats it as a
-			// comma-separated list, so `signed-by=<ours>,/evil.gpg` would widen the
-			// trust set while still "containing" ours: extract the value and
-			// compare it whole (path is case-sensitive on the filesystem).
+			// signed-by must appear EXACTLY once and be EXACTLY our keyring. apt
+			// matches the option name case-insensitively and treats the value as a
+			// comma list, so reject duplicates (`signed-by=/ours Signed-By=/evil`),
+			// mixed case, quotes, and appended keyrings.
+			optsLow := strings.ToLower(opts)
 			signedOK := false
-			if i := strings.Index(opts, "signed-by="); i >= 0 {
-				val := opts[i+len("signed-by="):]
+			if strings.Count(optsLow, "signed-by=") == 1 {
+				i := strings.Index(optsLow, "signed-by=")
+				val := opts[i+len("signed-by="):] // original case: it is a path
 				if e := strings.IndexAny(val, " \t]"); e >= 0 {
 					val = val[:e]
 				}
+				val = strings.Trim(val, "\"'")
 				signedOK = val == keyring
 			}
 			if unsafe || !signedOK {

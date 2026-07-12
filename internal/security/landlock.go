@@ -196,9 +196,12 @@ func WarnIfLandlockUnavailable(w io.Writer) bool {
 // probeABI returns the Landlock ABI version supported by the kernel.
 // LANDLOCK_CREATE_RULESET_VERSION (flag=1) with zero size returns the ABI version.
 func probeABI() (int, error) {
-	attr := RulesetAttr{}
+	// The version query requires attr==NULL and size==0; passing a non-NULL
+	// attr (even a zero-valued one) makes the kernel reject the call with
+	// EINVAL, which ush misread as "Landlock unsupported" and silently dropped
+	// the filesystem containment on every kernel that actually has Landlock.
 	ret, _, errno := unix.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET,
-		uintptr(unsafe.Pointer(&attr)), 0, 1)
+		0, 0, 1)
 	if errno != 0 {
 		return 0, errno
 	}

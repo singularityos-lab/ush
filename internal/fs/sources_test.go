@@ -40,6 +40,9 @@ func TestEnsureDebianSourcesRejectsCraftedTrusted(t *testing.T) {
 		"deb [signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg Trusted=yes] http://evil.example/d bookworm main\n",
 		"deb [ trusted=yes ] http://evil.example/d bookworm main\n",
 		"deb [allow-insecure=yes signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg] http://evil.example/d bookworm main\n",
+		// signed-by is a comma-separated list: an appended attacker keyring must
+		// NOT be accepted just because ours is present.
+		"deb [signed-by=/run/ush/exec/keyrings/debian-archive-keyring.gpg,/tmp/evil.gpg] http://evil.example/d bookworm main\n",
 	} {
 		dir := t.TempDir()
 		sl := filepath.Join(dir, "sources.list")

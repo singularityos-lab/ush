@@ -571,8 +571,10 @@ func (m *Manager) checkMaintainerScripts(ctx context.Context, stdout, stderr io.
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// apt-get download.
-	dlOut, dlErr := runCmdOutput("apt-get", "download", pkg)
+	// apt-get download. Apply the same security hardening as runApt so this
+	// pre-check cannot fetch from an unauthenticated sources.list.d repo.
+	dlArgs := append(aptSecurityFlags(), "download", pkg)
+	dlOut, dlErr := runCmdOutput("apt-get", dlArgs...)
 	if dlErr != nil {
 		ushlog.Debug("pkg: download pre-check failed", "pkg", pkg, "err", dlErr, "out", dlOut)
 		return nil
@@ -622,8 +624,25 @@ func (m *Manager) checkMaintainerScripts(ctx context.Context, stdout, stderr io.
 	return nil
 }
 
+// aptSecurityFlags force EVERY apt invocation to ignore the legacy trusted
+// keyrings (Dir::Etc::trusted / trustedparts) and the sources.list.d directory
+// (Dir::Etc::sourceparts), so apt honours only our signed-by verified
+// sources.list. These must be applied to every apt call -- runApt AND the
+// apt-get download pre-check -- or a leftover/planted repo re-enters through the
+// path that misses them.
+func aptSecurityFlags() []string {
+	return []string{
+		"-o", "Dir::Etc::trusted=/dev/null",
+		"-o", "Dir::Etc::trustedparts=/dev/null",
+		"-o", "Dir::Etc::sourceparts=/dev/null",
+	}
+}
+
 // runApt executes apt-get inside the guest with security flags.
 func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...string) error {
+	// Lead with the unconditional security hardening so it applies whether or not
+	// the bootstrapped-tools branch is taken.
+	args = append(aptSecurityFlags(), args...)
 	ushlog.Info("pkg: apt-get", "args", args)
 
 	// Verify apt-get is available - bootstrap may have failed on first run.
@@ -719,19 +738,13 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// only fetches amd64 packages, so pin it explicitly.
 		extraArgs = append(extraArgs, "-o", "APT::Architecture=amd64")
 
-		// Verify signatures via the staged gpgv + [signed-by=] keyring only.
-		// Disable the legacy trusted.gpg / trusted.gpg.d path, which makes apt
-		// shell out to the (absent) /usr/bin/apt-key and fail the whole update.
+		// apt 2.6 still shells out to apt-key at a hard-coded /usr/bin path for
+		// the clearsigned InRelease check; point it at the staged copy so it can
+		// run (it in turn calls the staged gpgv against the [signed-by] keyring).
+		// The trusted-keyring / sources.list.d hardening is applied unconditionally
+		// to EVERY apt invocation (runApt + the download pre-check) via
+		// aptSecurityFlags(), not just this bootstrapped path.
 		extraArgs = append(extraArgs,
-			"-o", "Dir::Etc::trusted=/dev/null",
-			"-o", "Dir::Etc::trustedparts=/dev/null",
-			// Ignore sources.list.d entirely: apt reads only our verified
-			// sources.list, so a leftover/planted *.list or *.sources deb822 file
-			// cannot add an unauthenticated repo.
-			"-o", "Dir::Etc::sourceparts=/dev/null",
-			// apt 2.6 still shells out to apt-key at a hard-coded /usr/bin path for
-			// the clearsigned InRelease check; point it at the staged copy so it can
-			// run (it in turn calls the staged gpgv against the [signed-by] keyring).
 			"-o", "Dir::Bin::apt-key="+guestExec+"/apt-key",
 			"-o", "APT::Key::gpgvcommand="+guestExec+"/gpgv",
 		)

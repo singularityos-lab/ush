@@ -433,9 +433,16 @@ func ensureDebianSources(aptDir string) bool {
 	sourcesD := filepath.Join(aptDir, "sources.list.d")
 	if entries, err := os.ReadDir(sourcesD); err == nil {
 		for _, e := range entries {
-			if err := os.Remove(filepath.Join(sourcesD, e.Name())); err == nil {
-				changed = true
+			p := filepath.Join(sourcesD, e.Name())
+			if rerr := os.RemoveAll(p); rerr != nil {
+				// Fail closed: if we cannot remove it, neutralise its content so it
+				// cannot define a repo, and warn loudly if even that fails.
+				if werr := os.WriteFile(p, nil, 0644); werr != nil {
+					ushlog.Warn("fs: SECURITY could not purge sources.list.d entry", "path", p, "err", werr)
+					continue
+				}
 			}
+			changed = true
 		}
 		if changed {
 			ushlog.Info("fs: sources.list.d purged (extra/host repos removed)")
@@ -462,12 +469,23 @@ func ensureDebianSources(aptDir string) bool {
 					opts = line[i : i+j+1]
 				}
 			}
-			low := strings.ToLower(strings.ReplaceAll(opts, " ", ""))
+			low := strings.ToLower(strings.NewReplacer(" ", "", "\t", "").Replace(opts))
 			unsafe := strings.Contains(low, "trusted=yes") ||
 				strings.Contains(low, "allow-insecure=yes") ||
 				strings.Contains(low, "allow-downgrade-to-insecure=yes")
-			// signed-by path is case-sensitive (a filesystem path).
-			if unsafe || !strings.Contains(opts, "signed-by="+keyring) {
+			// signed-by must be EXACTLY our keyring. apt treats it as a
+			// comma-separated list, so `signed-by=<ours>,/evil.gpg` would widen the
+			// trust set while still "containing" ours: extract the value and
+			// compare it whole (path is case-sensitive on the filesystem).
+			signedOK := false
+			if i := strings.Index(opts, "signed-by="); i >= 0 {
+				val := opts[i+len("signed-by="):]
+				if e := strings.IndexAny(val, " \t]"); e >= 0 {
+					val = val[:e]
+				}
+				signedOK = val == keyring
+			}
+			if unsafe || !signedOK {
 				allSafe = false
 				break
 			}

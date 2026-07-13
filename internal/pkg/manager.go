@@ -56,6 +56,13 @@ func New(layerMgr *fs.LayerManager, sessionID, pkgPrefix string) *Manager {
 	// pkgroot by a previous run before path-exclude was in place.
 	if pkgPrefix != "" {
 		cleanupCoreLibsFromPkgroot(pkgPrefix)
+		// dev (dsh): this runs at every guest-start, so a session that mounts the
+		// /usr overlay (pkgroot already populated) but does not reinstall would have
+		// no libc.so.6 target for the linker. Recreate the host-glibc symlinks after
+		// cleanup so linking works without a fresh install (#74). Idempotent.
+		if os.Getenv("USH_PROFILE") == "dev" {
+			ensureDevGlibcSymlinks(pkgPrefix)
+		}
 	}
 	return m
 }
@@ -915,6 +922,14 @@ func cleanupCoreLibsFromPkgroot(pkgPrefix string) {
 			continue
 		}
 		for _, p := range matches {
+			// Preserve the dev host-glibc symlinks (absolute target outside the
+			// pkgroot); still remove real Debian .so files and any pkgroot-internal
+			// glibc symlinks so a Debian runtime can never shadow the host.
+			if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if tgt, err := os.Readlink(p); err == nil && filepath.IsAbs(tgt) && !strings.HasPrefix(tgt, pkgPrefix) {
+					continue
+				}
+			}
 			if err := os.Remove(p); err == nil {
 				ushlog.Info("pkg: removed conflicting core lib from pkgroot", "path", p)
 			}

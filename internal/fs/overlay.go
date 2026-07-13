@@ -326,19 +326,29 @@ func (g *GuestFS) setupUsr() error {
 	// installed toolchain resolves everything at the absolute paths. Same mechanics as /etc
 	// and /var. Safe fallback: on any failure the guest keeps the working bind-RO /usr
 	// (dev-compile just unavailable), never a dead guest.
-	pkgUsr := filepath.Join(g.LayerDir, "persistent", "pkgroot", "usr")
-	if fi, err := os.Stat(pkgUsr); err != nil || !fi.IsDir() {
-		// Log the decision (do not silently no-op): before any pkg install this is expected,
-		// but if it fires when packages ARE installed the path or timing is wrong (#74).
-		ushlog.Info("fs: /usr overlay skipped (pkgroot/usr not present yet)", "pkgUsr", pkgUsr, "err", err)
+	guestPkgroot := filepath.Join(g.GuestRoot, g.LayerDir, "persistent", "pkgroot")
+	barePkgroot := filepath.Join(g.LayerDir, "persistent", "pkgroot")
+	pkgroot := ""
+	if fi, err := os.Stat(filepath.Join(guestPkgroot, "usr")); err == nil && fi.IsDir() {
+		pkgroot = guestPkgroot
+	} else if fi, err := os.Stat(filepath.Join(barePkgroot, "usr")); err == nil && fi.IsDir() {
+		pkgroot = barePkgroot
+	}
+	if pkgroot == "" {
+		ushlog.Info("fs: /usr overlay skipped (pkgroot/usr not present)",
+			"guestPkgUsr", filepath.Join(guestPkgroot, "usr"),
+			"barePkgUsr", filepath.Join(barePkgroot, "usr"),
+			"layerDir", g.LayerDir, "guestRoot", g.GuestRoot, "homeDir", g.HomeDir)
 		return nil
 	}
+	pkgUsr := filepath.Join(pkgroot, "usr")
 	dst := filepath.Join(g.GuestRoot, "usr")
-	work := filepath.Join(g.LayerDir, "persistent", "pkgroot-usr-work")
+	work := filepath.Join(pkgroot, ".usr-overlay-work")
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		ushlog.Warn("fs: /usr overlay workdir failed, keeping bind-RO /usr", "work", work, "err", err)
 		return nil
 	}
+	ushlog.Info("fs: /usr overlay pkgroot resolved", "pkgroot", pkgroot, "guest", pkgroot == guestPkgroot)
 	ushlog.Info("fs: overlaying /usr with pkgroot", "lower", "/usr", "upper", pkgUsr, "work", work, "dst", dst)
 	opts := fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s,userxattr", pkgUsr, work)
 	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {

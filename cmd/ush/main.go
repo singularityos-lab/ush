@@ -97,6 +97,7 @@ func run() error {
 	// -c "cmd" -> run non-interactively and exit.
 	// -v / --verbose -> enable INFO-level logs (default is WARN).
 	var cmdFlag string
+	var scriptFile string
 	verbose := false
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -108,6 +109,12 @@ func run() error {
 			}
 		case "-v", "--verbose":
 			verbose = true
+		default:
+			// Login-shell semantics: the first non-flag argument is a script file
+			// to run (`ush script.sh`). Ignored when -c is given.
+			if scriptFile == "" && !strings.HasPrefix(args[i], "-") {
+				scriptFile = args[i]
+			}
 		}
 	}
 
@@ -170,10 +177,22 @@ func run() error {
 		ushlog.Info("scope: running unscoped: " + err.Error())
 	}
 
-	// Propagate -c to child via env.
+	// Propagate the requested run-mode to the child via env (the child re-execs
+	// and reads these back inside the namespaces).
 	if cmdFlag != "" {
 		os.Setenv("USH_CMD", cmdFlag)
-	} else {
+	} else if scriptFile != "" {
+		// Read the script on the host side and hand its contents to the guest:
+		// the guest pivot_roots into its own filesystem, so a host path (e.g.
+		// /tmp/x.sh) would not resolve inside it. The whole script still runs
+		// through the sandboxed POSIX interpreter.
+		data, rerr := os.ReadFile(scriptFile)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "ush: cannot read script %s: %v\n", scriptFile, rerr)
+			os.Exit(1)
+		}
+		os.Setenv("USH_CMD", string(data))
+	} else if stdinIsTTY() {
 		// Interactive session: if the kernel lacks Landlock, say so loudly once,
 		// otherwise the weakened containment boundary is silent.
 		security.WarnIfLandlockUnavailable(os.Stderr)
@@ -181,6 +200,16 @@ func run() error {
 
 	// Parent phase: prepare and launch child in namespaces.
 	return runParent(cfg)
+}
+
+// stdinIsTTY reports whether standard input is a terminal. A false result means
+// ush was fed a script on stdin (pipe/redirect) and must run non-interactively.
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // appSlug derives a short app name for the scope unit from the -c command
@@ -844,9 +873,17 @@ func runGuestInit(cfg *config.Config) error {
 		return fmt.Errorf("shell: %w", err)
 	}
 
-	// -c mode: run a single command and exit (no banner).
+	// -c mode (also script-file mode: the parent reads `ush script.sh` on the
+	// host and forwards its contents here): run and exit, no banner.
 	if cmd := os.Getenv("USH_CMD"); cmd != "" {
 		return sh.RunLine(ctx, cmd)
+	}
+
+	// Non-interactive stdin (piped or redirected, e.g. `echo cmd | ush`): read
+	// the whole of stdin as a script and exit. Same POSIX interpreter, same
+	// sandbox; only a real terminal starts the interactive shell below.
+	if !stdinIsTTY() {
+		return sh.RunScript(ctx, os.Stdin, "stdin")
 	}
 
 	// Show banner.

@@ -1523,7 +1523,11 @@ func installPreloadShim(dst string) error {
 		ushlog.Info("fs: shim compiled", "path", dst)
 		return nil
 	} else {
-		ushlog.Warn("fs: unable to compile shim, trying prebuilt fallback", "err", err)
+		// Not being able to compile is expected before the user installs a C compiler; the
+		// prebuilt fallback below covers it. Log at INFO, not WARN, so the normal pre-gcc dsh
+		// start is not alarming. A genuine failure still surfaces as an error if the fallback
+		// is also missing.
+		ushlog.Info("fs: shim not compiled (no cc yet), using prebuilt fallback", "err", err)
 	}
 
 	for _, src := range preloadShimFallbacks() {

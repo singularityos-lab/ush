@@ -185,13 +185,20 @@ func (h *helper) mountOne(path string) error {
 	if path == "" || !filepath.IsAbs(path) {
 		return fmt.Errorf("invalid path")
 	}
-	if !h.isTrusted(path) {
+	// Resolve every symlink component before the policy check and the mount:
+	// both must act on the REAL target, never on a symlink a guest planted
+	// inside a trusted dir to point outside it (e.g. trusted/x -> ~/.ssh).
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+	if !h.isTrusted(real) {
 		return fmt.Errorf("not an approved trusted directory")
 	}
-	if fi, err := os.Stat(path); err != nil || !fi.IsDir() {
+	if fi, err := os.Lstat(real); err != nil || !fi.IsDir() {
 		return fmt.Errorf("not a directory")
 	}
-	return injectMount(path, path)
+	return injectMount(real, path)
 }
 
 // isTrusted re-reads the broker policy and reports whether path is at or below a
@@ -205,6 +212,12 @@ func (h *helper) isTrusted(path string) bool {
 		if r.Category != policy.Category("devdir") || r.Decision != policy.DecisionAllow {
 			continue
 		}
+		// The grant is pinned to its real (symlink-resolved) path at confirmation
+		// time (broker trustDir/trustDirConfirmed), so do NOT re-resolve it here.
+		// Re-resolving a mutable symlink grant on every check would let a guest
+		// retarget the symlink AFTER host approval and silently drift the trusted
+		// root onto an unauthorized path. Compare the already-resolved request
+		// (mountOne EvalSymlinks) against the stored real grant.
 		d := filepath.Clean(strings.TrimRight(r.Resource, "/"))
 		if path == d || strings.HasPrefix(path, d+"/") {
 			return true
@@ -233,9 +246,21 @@ func injectMount(src, dst string) error {
 			runtime.Goexit()
 		}
 
-		// Clone the source subtree while we still see the host filesystem.
-		fd, err := unix.OpenTree(unix.AT_FDCWD, src,
-			uint(unix.OPEN_TREE_CLONE|unix.AT_RECURSIVE))
+		// Open the (already symlink-resolved) source with openat2 refusing any
+		// symlink, then clone from that stable fd: nothing can be swapped under
+		// us between the policy check and the clone (TOCTOU), and no symlink
+		// component can redirect the clone off the trusted subtree.
+		srcfd, err := unix.Openat2(unix.AT_FDCWD, src, &unix.OpenHow{
+			Flags:   uint64(unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC),
+			Resolve: unix.RESOLVE_NO_SYMLINKS,
+		})
+		if err != nil {
+			done <- fmt.Errorf("openat2 %s: %w", src, err)
+			runtime.Goexit()
+		}
+		fd, err := unix.OpenTree(srcfd, "",
+			uint(unix.OPEN_TREE_CLONE|unix.AT_RECURSIVE|unix.AT_EMPTY_PATH))
+		unix.Close(srcfd)
 		if err != nil {
 			done <- fmt.Errorf("open_tree %s: %w", src, err)
 			runtime.Goexit()

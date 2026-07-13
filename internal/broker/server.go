@@ -504,6 +504,15 @@ func (s *Server) trustDir(path string) error {
 	if path == "" {
 		return fmt.Errorf("empty path")
 	}
+	// Pin the real target NOW: resolve every symlink before showing the consent
+	// dialog and before persisting, so the user confirms the actual directory and
+	// a symlink the guest retargets after approval cannot drift the grant to a new
+	// location (mutable-symlink-grant escape).
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve trust path: %w", err)
+	}
+	path = real
 	if !s.confirmDialog(
 		"USH - Trust developer directory",
 		fmt.Sprintf("Give the sandbox FULL host access to this directory?\n\n%s\n\n"+
@@ -526,9 +535,17 @@ func (s *Server) trustDirConfirmed(path string) error {
 	if path == "" {
 		return fmt.Errorf("empty path")
 	}
+	// Resolve symlinks so the persisted grant is pinned to the real target, not a
+	// mutable symlink the guest can later retarget (see trustDir). Idempotent when
+	// trustDir already resolved; also protects the host-UI direct caller.
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fmt.Errorf("resolve trust path: %w", err)
+	}
+	path = real
 	s.mu.Lock()
 	s.policy.Set(devDirCategory, path, policy.DecisionAllow)
-	err := s.policy.Save()
+	err = s.policy.Save()
 	s.mu.Unlock()
 	if err != nil {
 		return err

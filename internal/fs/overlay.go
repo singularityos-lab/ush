@@ -316,6 +316,35 @@ func (g *GuestFS) bindRODirs() error {
 // Packages are installed into pkgPrefix (via dpkg --instdir) instead
 // of /usr, so /usr can stay read-only.
 func (g *GuestFS) setupUsr() error {
+	// dsh developer shell: apt installs headers/libs into <pkgroot>/usr/{include,lib,...},
+	// but gcc/ld search /usr/include, /usr/lib absolutely (and the glibc linker scripts use
+	// absolute paths), so with the plain bind-RO /usr from bindRODirs the installed dev files
+	// are invisible and C will not compile or link. Overlay /usr: lower = host /usr (RO system
+	// headers/libs/crt), upper = pkgroot/usr (apt's RW install target). The two merge, so an
+	// installed toolchain resolves everything at the absolute paths. Same mechanics as /etc
+	// and /var. Safe fallback: on any failure the guest keeps the working bind-RO /usr
+	// (dev-compile just unavailable), never a dead guest.
+	pkgUsr := filepath.Join(g.LayerDir, "persistent", "pkgroot", "usr")
+	if fi, err := os.Stat(pkgUsr); err != nil || !fi.IsDir() {
+		return nil // nothing installed yet: the bind-RO /usr is correct
+	}
+	dst := filepath.Join(g.GuestRoot, "usr")
+	work := filepath.Join(g.LayerDir, "persistent", "pkgroot-usr-work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		ushlog.Warn("fs: /usr overlay workdir failed, keeping bind-RO /usr", "err", err)
+		return nil
+	}
+	opts := fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s,userxattr", pkgUsr, work)
+	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
+		ushlog.Info("fs: /usr overlaid with pkgroot (dev headers/libs at absolute paths)")
+		return nil
+	}
+	opts = fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s", pkgUsr, work)
+	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
+		ushlog.Info("fs: /usr overlaid with pkgroot")
+		return nil
+	}
+	ushlog.Warn("fs: /usr pkgroot overlay unavailable, keeping bind-RO /usr (dev compile disabled)", "pkgUsr", pkgUsr)
 	return nil
 }
 

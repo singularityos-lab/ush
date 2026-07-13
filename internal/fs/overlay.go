@@ -110,9 +110,6 @@ func (g *GuestFS) Setup() error {
 	if err := g.bindRODirs(); err != nil {
 		return err
 	}
-	if err := g.setupUsr(); err != nil {
-		return err
-	}
 	if err := g.setupEtc(); err != nil {
 		return err
 	}
@@ -123,6 +120,11 @@ func (g *GuestFS) Setup() error {
 		return err
 	}
 	if err := g.bindPkgLayer(); err != nil {
+		return err
+	}
+	// After the pkgroot is exposed, overlay /usr so installed dev headers/libs (in
+	// pkgroot/usr) show at their absolute paths /usr/include, /usr/lib (#74).
+	if err := g.setupUsr(); err != nil {
 		return err
 	}
 	if err := g.applyExtraBinds(); err != nil {
@@ -326,25 +328,32 @@ func (g *GuestFS) setupUsr() error {
 	// (dev-compile just unavailable), never a dead guest.
 	pkgUsr := filepath.Join(g.LayerDir, "persistent", "pkgroot", "usr")
 	if fi, err := os.Stat(pkgUsr); err != nil || !fi.IsDir() {
-		return nil // nothing installed yet: the bind-RO /usr is correct
+		// Log the decision (do not silently no-op): before any pkg install this is expected,
+		// but if it fires when packages ARE installed the path or timing is wrong (#74).
+		ushlog.Info("fs: /usr overlay skipped (pkgroot/usr not present yet)", "pkgUsr", pkgUsr, "err", err)
+		return nil
 	}
 	dst := filepath.Join(g.GuestRoot, "usr")
 	work := filepath.Join(g.LayerDir, "persistent", "pkgroot-usr-work")
 	if err := os.MkdirAll(work, 0o755); err != nil {
-		ushlog.Warn("fs: /usr overlay workdir failed, keeping bind-RO /usr", "err", err)
+		ushlog.Warn("fs: /usr overlay workdir failed, keeping bind-RO /usr", "work", work, "err", err)
 		return nil
 	}
+	ushlog.Info("fs: overlaying /usr with pkgroot", "lower", "/usr", "upper", pkgUsr, "work", work, "dst", dst)
 	opts := fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s,userxattr", pkgUsr, work)
 	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
 		ushlog.Info("fs: /usr overlaid with pkgroot (dev headers/libs at absolute paths)")
 		return nil
+	} else {
+		ushlog.Info("fs: /usr overlay (userxattr) failed, retrying without", "err", err)
 	}
 	opts = fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s", pkgUsr, work)
 	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
 		ushlog.Info("fs: /usr overlaid with pkgroot")
 		return nil
+	} else {
+		ushlog.Warn("fs: /usr pkgroot overlay unavailable, keeping bind-RO /usr (dev compile disabled)", "upper", pkgUsr, "work", work, "err", err)
 	}
-	ushlog.Warn("fs: /usr pkgroot overlay unavailable, keeping bind-RO /usr (dev compile disabled)", "pkgUsr", pkgUsr)
 	return nil
 }
 

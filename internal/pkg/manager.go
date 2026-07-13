@@ -154,9 +154,7 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 		if err := os.MkdirAll(m.pkgPrefix, 0755); err != nil {
 			ushlog.Warn("pkg: unable to create pkgPrefix", "err", err)
 		} else {
-			base := aptArgs[:len(aptArgs)-2]
-			tail := []string{aptArgs[len(aptArgs)-2], aptArgs[len(aptArgs)-1]}
-			opts := []string{
+			aptArgs = append(aptArgs[:len(aptArgs)-2],
 				"--reinstall",
 				"-o", fmt.Sprintf("Dpkg::Options::=--instdir=%s", m.pkgPrefix),
 				"-o", fmt.Sprintf("Dpkg::Options::=--admindir=%s", adminDir),
@@ -174,25 +172,16 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 				"-o", "Dpkg::Options::=--force-not-root",
 				"-o", "Dpkg::Options::=--path-exclude=/usr/share/man/*",
 				"-o", "Dpkg::Options::=--path-exclude=/usr/share/doc/*",
-			}
-			if os.Getenv("USH_PROFILE") != "dev" {
-				// Secure ush profile: keep core glibc/loader out of the pkgroot so a
-				// Debian glibc cannot shadow the host runtime. The dev (dsh) profile
-				// needs the full Debian glibc+loader to link and RUN compiled binaries,
-				// and its guest is pivot-isolated from the host, so the exclusion is
-				// dropped there and the pkgroot is made merged-usr instead (#74).
-				opts = append(opts,
-					"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/libc.so.6",
-					"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/libc-*.so",
-					"-o", "Dpkg::Options::=--path-exclude=/lib/*/libc.so.6",
-					"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/ld-linux*.so*",
-					"-o", "Dpkg::Options::=--path-exclude=/lib/*/ld-linux*.so*",
-					"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/ld-*.so*",
-				)
-			} else {
-				ensureMergedUsrPkgroot(m.pkgPrefix)
-			}
-			aptArgs = append(append(base, opts...), tail...)
+				// Prevent core glibc runtime from being installed into pkgroot.
+				// These would shadow the host's (newer) glibc and crash host binaries.
+				"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/libc.so.6",
+				"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/libc-*.so",
+				"-o", "Dpkg::Options::=--path-exclude=/lib/*/libc.so.6",
+				"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/ld-linux*.so*",
+				"-o", "Dpkg::Options::=--path-exclude=/lib/*/ld-linux*.so*",
+				"-o", "Dpkg::Options::=--path-exclude=/usr/lib/*/ld-*.so*",
+				aptArgs[len(aptArgs)-2], aptArgs[len(aptArgs)-1],
+			)
 		}
 	}
 	aptArgs = append(aptArgs, pkgs...)
@@ -204,10 +193,14 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 	// Remove core glibc runtime files that apt may have installed into pkgroot
 	// despite the path-exclude options (some are installed as symlinks or via
 	// triggers). These must come from the base system to avoid version conflicts.
-	// The dev (dsh) profile keeps them: it needs the Debian glibc+loader to link
-	// and run compiled binaries, and its guest is pivot-isolated from the host.
-	if m.pkgPrefix != "" && os.Getenv("USH_PROFILE") != "dev" {
+	if m.pkgPrefix != "" {
 		cleanupCoreLibsFromPkgroot(m.pkgPrefix)
+		// dev (dsh) toolchain: the glibc runtime stays excluded (host-shadow safety),
+		// but the dev linker-script needs a libc.so.6 target. Symlink it to the host
+		// glibc exposed by the /usr overlay lower, AFTER cleanup so it is not removed.
+		if os.Getenv("USH_PROFILE") == "dev" {
+			ensureDevGlibcSymlinks(m.pkgPrefix)
+		}
 	}
 
 	// Bind-mount data directories from pkgroot/usr/share/* onto /usr/share/*
@@ -929,46 +922,39 @@ func cleanupCoreLibsFromPkgroot(pkgPrefix string) {
 	}
 }
 
-// ensureMergedUsrPkgroot makes the dev pkgroot a merged-usr tree (lib->usr/lib,
-// bin->usr/bin, sbin->usr/sbin, lib64->lib) so .deb payloads written to /lib,
-// /bin, /sbin land under /usr where the guest /usr overlay exposes them, and the
-// dynamic linker (looking up /lib/<triple>/libc.so.6) resolves into the overlay.
-// A pre-existing real directory is migrated into its /usr counterpart, then
-// replaced by the symlink. Best-effort: a failed link just leaves that dir plain.
-func ensureMergedUsrPkgroot(pkgPrefix string) {
-	for _, d := range []string{"usr/lib", "usr/bin", "usr/sbin"} {
-		if err := os.MkdirAll(filepath.Join(pkgPrefix, d), 0o755); err != nil {
-			ushlog.Warn("pkg: merged-usr mkdir failed", "dir", d, "err", err)
-		}
+// ensureDevGlibcSymlinks points the dev pkgroot's multiarch core libs at the host
+// glibc. The Debian libc6 runtime is excluded from the pkgroot (host-shadow
+// safety), so the libc6-dev linker-script's GROUP( /lib/x86_64-linux-gnu/libc.so.6 )
+// has no target and linking fails. The guest is already merged-usr
+// (/lib -> /usr/lib), so /lib/x86_64-linux-gnu/libc.so.6 resolves to
+// /usr/lib/x86_64-linux-gnu/libc.so.6 in the overlay; a symlink there to the host
+// glibc (/usr/lib/<lib>, exposed by the overlay lower) lets the link resolve. The
+// loader is left untouched (host PT_INTERP), so link and run use one glibc and the
+// host is never shadowed. Only libs the host actually provides are linked, so no
+// dangling targets appear.
+func ensureDevGlibcSymlinks(pkgPrefix string) {
+	multiarch := filepath.Join(pkgPrefix, "usr", "lib", "x86_64-linux-gnu")
+	if err := os.MkdirAll(multiarch, 0o755); err != nil {
+		ushlog.Warn("pkg: dev glibc symlink dir failed", "dir", multiarch, "err", err)
+		return
 	}
-	for _, l := range []struct{ link, target string }{
-		{"lib", "usr/lib"},
-		{"bin", "usr/bin"},
-		{"sbin", "usr/sbin"},
-		{"lib64", "lib"},
+	for _, lib := range []string{
+		"libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2",
+		"librt.so.1", "libresolv.so.2", "libutil.so.1",
 	} {
-		p := filepath.Join(pkgPrefix, l.link)
-		if fi, err := os.Lstat(p); err == nil {
-			if fi.Mode()&os.ModeSymlink != 0 {
-				continue
-			}
-			dstDir := filepath.Join(pkgPrefix, l.target)
-			os.MkdirAll(dstDir, 0o755)
-			if entries, e := os.ReadDir(p); e == nil {
-				for _, ent := range entries {
-					os.Rename(filepath.Join(p, ent.Name()), filepath.Join(dstDir, ent.Name()))
-				}
-			}
-			if e := os.RemoveAll(p); e != nil {
-				ushlog.Warn("pkg: merged-usr migrate failed", "path", p, "err", e)
-				continue
-			}
+		target := filepath.Join("/usr/lib", lib)
+		if _, err := os.Stat(target); err != nil {
+			continue // host does not provide it; skip to avoid a dangling link
 		}
-		if e := os.Symlink(l.target, p); e != nil {
-			ushlog.Warn("pkg: merged-usr symlink failed", "link", p, "target", l.target, "err", e)
+		link := filepath.Join(multiarch, lib)
+		if _, err := os.Lstat(link); err == nil {
+			continue // real file or link already present
+		}
+		if err := os.Symlink(target, link); err != nil {
+			ushlog.Warn("pkg: dev glibc symlink failed", "link", link, "target", target, "err", err)
 		}
 	}
-	ushlog.Info("pkg: dev pkgroot merged-usr layout ensured", "pkgroot", pkgPrefix)
+	ushlog.Info("pkg: dev pkgroot core libs symlinked to host glibc", "dir", multiarch)
 }
 
 // bindPkgShareDirs overlays pkgPrefix/usr/share on top of /usr/share so package

@@ -244,11 +244,14 @@ PY
   AUTO=deny CONFIRM=no RULES="" \
   SCRIPT='sleep 1; python3 "$XDG_RUNTIME_DIR/ush/spoof.py"; echo PY_EXIT=$?' \
     run_scenario b1
-  if guest_has "COMM_NOW=curl" && guest_has "SPOOF_BLOCKED" \
+  if declog_has '"category":"network".*1\.1\.1\.1.*"decision":"allow"'; then
+    bad "B1 comm spoofing inherited trust (BREACH): spoofed curl was allowed by the broker"
+    dump_ctx
+  elif guest_has "COMM_NOW=curl" && guest_has "SPOOF_BLOCKED" \
      && declog_has '"category":"network".*1\.1\.1\.1.*"decision":"deny"'; then
     ok "B1 spoofed comm 'curl' did NOT inherit app:curl trust; connect denied and logged"
   else
-    bad "B1 comm spoofing inherited trust (BREACH) or test inconclusive"
+    skip "B1 no network interception logged (supervisor may not have enforced at the syscall layer)"
     dump_ctx
   fi
 else

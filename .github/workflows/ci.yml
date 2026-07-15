@@ -93,13 +93,7 @@ jobs:
         run: go mod verify
       - name: shim source compiles
         run: |
-          python3 - <<'PY'
-          src = open('internal/preload/chown_shim.go').read()
-          i = src.index('var DpkgShimC = `') + len('var DpkgShimC = `')
-          j = src.index('`', i)
-          open('/tmp/shim.c', 'w').write(src[i:j])
-          PY
-          cc -shared -fPIC -o /tmp/ush-chown-shim.so /tmp/shim.c
+          cc -shared -fPIC -o /tmp/ush-chown-shim.so internal/preload/csrc/ush-chown-shim.c
           echo "shim C source compiles cleanly"
 
   # Stage 6: adversarial end-to-end harness. Runs the secure ush profile under

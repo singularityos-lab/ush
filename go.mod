@@ -2,6 +2,8 @@ module github.com/singularityos-lab/ush
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/klauspost/compress v1.19.0

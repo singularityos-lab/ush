@@ -189,7 +189,7 @@ func WarnIfLandlockUnavailable(w io.Writer) bool {
 	fmt.Fprintln(w, "  The filesystem containment boundary is NOT enforced; ush is relying")
 	fmt.Fprintln(w, "  on namespaces + seccomp only. Rebuild the kernel with")
 	fmt.Fprintln(w, "  CONFIG_SECURITY_LANDLOCK=y and \"landlock\" in CONFIG_LSM")
-	fmt.Fprintln(w, "  (see docs/SECURITY-BUILD.md in the Singularity OS repo).")
+	fmt.Fprintln(w, "  (see docs/SECURITY-BUILD.md in the Sinty OS repo).")
 	return false
 }
 

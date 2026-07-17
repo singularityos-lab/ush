@@ -26,18 +26,17 @@ static int is_write_flags(int flags) {
 }
 
 static char *redirect_path(const char *path) {
-    const char *prefix = getenv("USH_PKG_PREFIX");
-    if (!prefix || !*prefix || !path || path[0] != '/') return NULL;
-    if (strncmp(path, "/usr/", 5) != 0) return NULL;
-
-    size_t plen = strlen(prefix);
-    if (strncmp(path, prefix, plen) == 0) return NULL;
-
-    size_t len = plen + strlen(path) + 1;
-    char *out = malloc(len);
-    if (!out) return NULL;
-    snprintf(out, len, "%s%s", prefix, path);
-    return out;
+    // Path redirection is disabled: dpkg now installs with --instdir=/ so it writes
+    // THROUGH the /usr fuse-overlayfs (the subuid range lets the rootless overlay
+    // copy-up), and the overlay itself carries pkgroot into /usr. The old redirect
+    // rewrote /usr writes into the raw upperdir behind the overlay, which the merged
+    // view never reliably surfaced (new dirs, in-both files), and it only ever
+    // covered writes (never reads or execve), so maintainer scripts still broke.
+    // Redirect and overlay were two half-mechanisms for the same job; the overlay is
+    // the one that also covers the kernel's execve. This shim now does identity
+    // remapping (uid/gid) only.
+    (void)path;
+    return NULL;
 }
 
 static void ensure_parent_dirs(const char *path) {
@@ -135,8 +134,8 @@ int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
  * stat family: keep the faked identity consistent. When USH_PRELOAD_IDENTITY
  * is "host", getuid()/geteuid() report the host UID, but every file in the
  * single-UID guest namespace is really owned by UID 0. Apps that verify a path
- * is owned by their own UID (tmpdir/config security checks, which Node/Bun and
- * some sandboxed runtimes do and otherwise refuse to start) would see owner 0 != euid. We
+ * is owned by their own UID (tmpdir/config security checks, which Node and Bun
+ * do and otherwise refuse to start) would see owner 0 != euid. We
  * rewrite the reported owner of UID-0 files to the host UID so that getuid()
  * equals st_uid again. When IDENTITY is not "host" (pkg/dpkg mode)
  * get_host_uid() returns 0 and these wrappers are pure pass-through, so apt and

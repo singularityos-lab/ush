@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mirko Brombin <brombin94@gmail.com>
 
-// Package fuse implements a userspace overlay backend for layer inspection
-// and diff operations. The FUSEBackend provides COW (copy-on-write) semantics
-// with whiteout files, matching the overlayfs convention, but entirely in
-// userspace - no kernel overlayfs or mount required.
-//
-// For mounting the actual guest filesystem, ush uses either kernel overlayfs
-// (with tmpfs fallback when overlayfs is unavailable) via internal/fs/overlay.go.
-// This package is used for layer inspection (pkg diff, pkg inspect) and as
-// the foundation for a future FUSE mount backend.
+// Package fuse implements a userspace overlay backend with copy-on-write
+// semantics and whiteout files following the overlayfs convention, entirely in
+// userspace - no kernel overlayfs or mount required. The guest filesystem
+// itself is mounted elsewhere (internal/fs/overlay.go, which prefers
+// fuse-overlayfs and falls back to the kernel driver); this package computes
+// layer merges and diffs without mounting anything.
 package fuse
 
 import (

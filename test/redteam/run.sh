@@ -57,7 +57,7 @@ note "building ush and ush-broker"
 #
 # It starts a PRIVATE dbus-daemon whose socket lives under XDG_RUNTIME_DIR.
 # ush bind-mounts XDG_RUNTIME_DIR into the guest, so the guest reaches the same
-# broker after pivot_root (an abstract/​/tmp socket would not survive pivot).
+# broker after pivot_root (an abstract or /tmp socket would not survive pivot).
 # Storage is a clean per-scenario dir, isolated from the user's real layers.
 BROKERLOG=""
 run_scenario() {

@@ -63,6 +63,26 @@ var requiredPackages = []pkgSpec{
 	// authenticates InRelease instead of installing unverified indices.
 	{name: "gpgv", poolPath: "pool/main/g/gpgv"},
 	{name: "debian-archive-keyring", poolPath: "pool/main/d/debian-archive-keyring"},
+	// bash is Essential in Debian, so apt assumes it is already present and never
+	// pulls it in as a dependency -- but the Sinty base is BusyBox-only, so every
+	// installed package with a `#!/bin/bash` script fails to exec (ENOENT on the
+	// interpreter). Stage it here so the guest has a real bash; the fs setup then
+	// exposes it at the absolute /bin/bash the shebangs need. libtinfo6 is bash's
+	// non-libc shared dep and is staged into the guest lib path like the apt libs.
+	{name: "bash", poolPath: "pool/main/b/bash"},
+	{name: "libtinfo6", poolPath: "pool/main/n/ncurses"},
+	// perl-base runs Debian debconf maintainer scripts. debconf's confmodule execs
+	// /usr/share/debconf/frontend (perl); the busybox base has no perl, so every
+	// package with a debconf postinst dies with exit 127. perl-base is Priority
+	// required and is the ONLY dependency debconf declares (its Debconf:: modules
+	// ship with the debconf package installed into the pkgroot), so it alone is
+	// enough with DEBIAN_FRONTEND=noninteractive. setupPerl exposes it at
+	// /usr/bin/perl in the guest.
+	{name: "perl-base", poolPath: "pool/main/p/perl"},
+	// perl links libcrypt.so.1, which the Sinty base does not ship (libc/libm it
+	// does). Stage it like libtinfo6 for bash; it lands in the guest lib path so
+	// the /usr/bin/perl seeded from perl-base resolves it.
+	{name: "libcrypt1", poolPath: "pool/main/libx/libxcrypt"},
 }
 
 type pkgSpec struct {
@@ -70,8 +90,26 @@ type pkgSpec struct {
 	poolPath string
 }
 
-// ToolsDir returns the path to the local tools directory.
+// SystemToolsDir is the read-only tools tree an image can ship pre-baked, so the
+// first run costs nothing. Deliberately not overridable from the environment:
+// it is where apt and dpkg are executed from, and letting a caller redirect it
+// would let any user point the sandbox at a trojaned apt.
+const SystemToolsDir = "/usr/share/ush/tools"
+
+// ToolsDir returns the tools directory in use: the pre-baked system tree when
+// the image ships one, otherwise the per-user one that EnsureApt downloads into.
+// The system tree can stay read-only, since EnsureApt writes nothing once apt,
+// dpkg and the method drivers are all present.
 func ToolsDir() string {
+	if _, err := os.Stat(filepath.Join(SystemToolsDir, "usr", "bin", "apt-get")); err == nil {
+		return SystemToolsDir
+	}
+	return UserToolsDir()
+}
+
+// UserToolsDir is the writable per-user tools tree, used when the image ships no
+// pre-baked one (and as the bootstrap target).
+func UserToolsDir() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "/tmp/ush-tools"
@@ -95,9 +133,14 @@ func DpkgPath() string {
 }
 
 func findBin(name string) string {
+	// Both trees: the pre-baked system one (ToolsDir when present) and the
+	// per-user one EnsureApt downloads into, so a half-baked image that still
+	// needed a download is found either way.
 	candidates := []string{
-		filepath.Join(ToolsDir(), "usr", "bin", name),
-		filepath.Join(ToolsDir(), "bin", name),
+		filepath.Join(SystemToolsDir, "usr", "bin", name),
+		filepath.Join(SystemToolsDir, "bin", name),
+		filepath.Join(UserToolsDir(), "usr", "bin", name),
+		filepath.Join(UserToolsDir(), "bin", name),
 		"/usr/local/bin/" + name,
 		"/usr/bin/" + name,
 		"/bin/" + name,
@@ -125,7 +168,24 @@ func EnsureApt() error {
 	}
 
 	fmt.Fprintln(os.Stderr, "USH: first run - downloading apt/dpkg from deb.debian.org (this happens once)...")
-	toolsDir := ToolsDir()
+	// Download into the per-user tree, never ToolsDir(): if a pre-baked system
+	// tree exists it is read-only, and in that case AptGetPath already returned
+	// above so we would not be here anyway. Being explicit keeps it that way.
+	return bootstrapInto(UserToolsDir())
+}
+
+// BakeToolsInto populates a tools tree at an arbitrary path so an image build can
+// pre-stage it at SystemToolsDir. Same code and same package set as the runtime
+// bootstrap, so what ships is exactly what the download would have produced.
+// Build-time only: needs network and writes to dir.
+func BakeToolsInto(dir string) error {
+	fmt.Fprintf(os.Stderr, "USH: baking apt/dpkg tools into %s\n", dir)
+	return bootstrapInto(dir)
+}
+
+// bootstrapInto downloads and extracts the required Debian packages into toolsDir,
+// then ensures the apt method drivers are present.
+func bootstrapInto(toolsDir string) error {
 	if err := os.MkdirAll(toolsDir, 0755); err != nil {
 		return fmt.Errorf("tools: mkdir %s: %w", toolsDir, err)
 	}
@@ -167,16 +227,21 @@ func EnsureApt() error {
 		}
 	}
 
-	// Ensure method drivers are available in the tools dir.
-	// When host apt exists, create symlinks from the host methods to the tools dir.
-	ensureMethodsSymlinks()
+	// Ensure method drivers are available in the tools dir. The extracted apt
+	// package normally ships them, so this is usually a no-op; the symlink path
+	// only kicks in on a host that lacks them in the .deb.
+	ensureMethodsSymlinksIn(toolsDir)
 
-	if AptGetPath() == "" || DpkgPath() == "" {
+	// Verify against toolsDir directly, not the global search path: at build time
+	// SystemToolsDir does not yet exist, so AptGetPath would look in the wrong place.
+	haveApt := statBin(toolsDir, "apt-get")
+	haveDpkg := statBin(toolsDir, "dpkg")
+	if !haveApt || !haveDpkg {
 		missing := []string{}
-		if AptGetPath() == "" {
+		if !haveApt {
 			missing = append(missing, "apt-get")
 		}
-		if DpkgPath() == "" {
+		if !haveDpkg {
 			missing = append(missing, "dpkg")
 		}
 		if len(failed) > 0 {
@@ -188,11 +253,22 @@ func EnsureApt() error {
 	return nil
 }
 
+// statBin reports whether name exists under toolsDir/usr/bin or toolsDir/bin.
+func statBin(toolsDir, name string) bool {
+	for _, sub := range []string{"usr/bin", "bin"} {
+		if _, err := os.Stat(filepath.Join(toolsDir, sub, name)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureMethodsSymlinks creates symlinks in the tools dir for apt method drivers
 // (http, https, etc.) if they exist on the host system but not in the tools dir.
 // This ensures network-based package operations work inside the namespace.
-func ensureMethodsSymlinks() {
-	toolsDir := ToolsDir()
+func ensureMethodsSymlinks() { ensureMethodsSymlinksIn(ToolsDir()) }
+
+func ensureMethodsSymlinksIn(toolsDir string) {
 	methodsDir := filepath.Join(toolsDir, "usr", "lib", "apt", "methods")
 
 	// If the tools dir already has method drivers, nothing to do.

@@ -61,6 +61,14 @@ func main() {
 }
 
 func run() error {
+	// Build-time only: `ush --bake-tools <dir>` populates a pre-baked apt/dpkg
+	// tools tree so the shipped image needs no first-run download. Handled here,
+	// before the flag parse (which would otherwise take the dir as a script) and
+	// before any namespace work. The image build calls it; users never do.
+	if len(os.Args) >= 3 && os.Args[1] == "--bake-tools" {
+		return tools.BakeToolsInto(os.Args[2])
+	}
+
 	// Developer userns stub: the first exec after an unmapped clone(CLONE_NEWUSER)
 	// for dsh. It runs without capabilities and only waits for the parent to write
 	// our subordinate id map, then re-execs the real guest init (mapped, with
@@ -241,7 +249,38 @@ func dshAdminSub() string {
 
 // runDshAdmin toggles or reports the developer-shell opt-in. Enabling is refused
 // when the image/managed policy forbids dsh.
+//
+// The opt-in marker is owned by the host-side broker's storage dir. When this
+// runs inside a sandboxed ush (the user's login shell on Sinty IS ush, so
+// `ush dsh enable` is almost always typed there), writing it directly would land
+// in the ephemeral overlay and the dsh gate would never see it. So route through
+// the broker when one is reachable; fall back to the local file only when ush
+// runs on a plain host with no broker.
 func runDshAdmin(sub, storageDir string) error {
+	if c := dshBrokerClient(); c != nil {
+		defer c.Close()
+		switch sub {
+		case "status":
+			pol, enabled, err := c.DevShellStatus()
+			if err != nil {
+				return fmt.Errorf("dsh: %w", err)
+			}
+			fmt.Printf("policy:  %s\n", pol)
+			fmt.Printf("enabled: %v\n", enabled)
+		case "enable":
+			if err := c.SetDevShellEnabled(true); err != nil {
+				return fmt.Errorf("dsh: %w", err)
+			}
+			fmt.Println("dsh: developer shell enabled")
+		case "disable":
+			if err := c.SetDevShellEnabled(false); err != nil {
+				return fmt.Errorf("dsh: %w", err)
+			}
+			fmt.Println("dsh: developer shell disabled")
+		}
+		return nil
+	}
+
 	switch sub {
 	case "status":
 		pol, enabled := devpolicy.Status(storageDir)
@@ -259,6 +298,20 @@ func runDshAdmin(sub, storageDir string) error {
 		fmt.Println("dsh: developer shell disabled")
 	}
 	return nil
+}
+
+// dshBrokerClient returns a broker client when one is reachable, else nil. Used
+// so the dsh admin commands hit the host-owned opt-in storage rather than the
+// sandbox copy.
+func dshBrokerClient() *broker.Client {
+	if !broker.IsAvailable() {
+		return nil
+	}
+	c, err := broker.NewClient("")
+	if err != nil {
+		return nil
+	}
+	return c
 }
 
 // runParent prepares the namespaces and re-launches the process in the guest.
@@ -329,8 +382,34 @@ func runParent(cfg *config.Config) error {
 		HostGID:   os.Getgid(),
 	}
 
-	// Developer (dsh) profile: map a subordinate id range into the guest so
-	// nested rootless containers (podman/distrobox) have ids to work with.
+	// Map a subordinate id range into the guest (both profiles). It is what lets
+	// rootless fuse-overlayfs write THROUGH the /usr overlay: a copy-up chowns the
+	// created file/dir to its target id, which needs more than one mapped id. With
+	// only a single 0->host mapping, dpkg must write behind the overlay (raw upper),
+	// and fuse-overlayfs does not reliably surface writes made behind it (new dirs,
+	// files in in-both subdirs), which broke debconf maintainer scripts. The range
+	// is subordinate (validated by newuidmap/newgidmap against /etc/sub{u,g}id),
+	// every id unprivileged, the user namespace unchanged: uid 0 in the guest is
+	// still a non-privileged real uid, so the host stays non-rootable.
+	if u, err := user.Current(); err == nil {
+		if s, c, ok := ns.LookupSubID("/etc/subuid", u.Username, u.Uid); ok {
+			nsCfg.UseSubuid = true
+			nsCfg.SubUIDStart, nsCfg.SubUIDCount = s, c
+		}
+		if s, c, ok := ns.LookupSubID("/etc/subgid", u.Username, u.Uid); ok {
+			nsCfg.SubGIDStart, nsCfg.SubGIDCount = s, c
+		}
+	}
+	if !nsCfg.UseSubuid || nsCfg.SubGIDCount == 0 {
+		nsCfg.UseSubuid = false
+		ushlog.Warn("ush: no /etc/subuid or /etc/subgid range for this user; pkg install of packages with maintainer scripts may fail")
+	} else {
+		ushlog.Info("ush: subordinate id range mapped (rootless overlay write-through)",
+			"subuid", fmt.Sprintf("%d+%d", nsCfg.SubUIDStart, nsCfg.SubUIDCount))
+	}
+
+	// Developer (dsh) profile: additionally share the host network namespace and
+	// delegate a cgroup, for nested rootless containers (podman/distrobox).
 	devProfile := os.Getenv("USH_PROFILE") == "dev"
 	if devProfile {
 		nsCfg.EnableCgroupNS = true // /sys/fs/cgroup rooted at the delegated scope
@@ -340,22 +419,6 @@ func runParent(cfg *config.Config) error {
 		nsCfg.EnableNet = false
 		enableNet = false
 		builtinNet = false
-		if u, err := user.Current(); err == nil {
-			if s, c, ok := ns.LookupSubID("/etc/subuid", u.Username, u.Uid); ok {
-				nsCfg.UseSubuid = true
-				nsCfg.SubUIDStart, nsCfg.SubUIDCount = s, c
-			}
-			if s, c, ok := ns.LookupSubID("/etc/subgid", u.Username, u.Uid); ok {
-				nsCfg.SubGIDStart, nsCfg.SubGIDCount = s, c
-			}
-		}
-		if !nsCfg.UseSubuid || nsCfg.SubGIDCount == 0 {
-			nsCfg.UseSubuid = false
-			ushlog.Warn("dsh: no /etc/subuid or /etc/subgid range for this user; nested containers will not work")
-		} else {
-			ushlog.Info("dsh: developer profile with subordinate id range",
-				"subuid", fmt.Sprintf("%d+%d", nsCfg.SubUIDStart, nsCfg.SubUIDCount))
-		}
 	}
 
 	// Inject the session ID into the child environment.
@@ -729,8 +792,8 @@ func runGuestInit(cfg *config.Config) error {
 	// the on-disk owner (every guest file is really UID 0), and apps that verify
 	// a path is owned by their own UID then refuse to start. The stat-family
 	// wrappers in the shim can keep the lie self-consistent for libc apps, but
-	// runtimes that stat via raw syscalls (e.g. Bun, which backs some sandboxed runtimes)
-	// bypass libc entirely and would still see the mismatch. GUI apps that need
+	// runtimes that stat via raw syscalls (some JS runtimes, e.g. Bun) bypass
+	// libc entirely and would still see the mismatch. GUI apps that need
 	// to appear non-root (Electron/Chromium, for the userns sandbox) can opt in
 	// per-process with USH_PRELOAD_IDENTITY=host, which the stat wrappers then
 	// make consistent.

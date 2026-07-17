@@ -95,7 +95,7 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 		n, err := os.Stdin.Read(b)
 		if err != nil {
 			if err == io.EOF && len(buf) == 0 {
-				fmt.Fprintln(os.Stdout)
+				fmt.Fprint(os.Stdout, "\r\n")
 				return "", io.EOF
 			}
 			return string(buf), err
@@ -105,7 +105,12 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 		switch {
 		// Enter
 		case b[0] == '\r' || b[0] == '\n':
-			fmt.Fprintln(os.Stdout)
+			// "\r\n", not Fprintln: raw mode is still on here (Restore runs on
+			// the deferred return), so ONLCR is off and a bare \n drops a line
+			// without returning the carriage. The cursor would stay at the column
+			// where the typed command ended and the command's own output would
+			// start from there, indented by however much the user typed.
+			fmt.Fprint(os.Stdout, "\r\n")
 			line := string(buf)
 			if line != "" {
 				rl.addHistory(line)
@@ -114,7 +119,7 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 
 		// Ctrl+C
 		case b[0] == 3:
-			fmt.Fprintln(os.Stdout)
+			fmt.Fprint(os.Stdout, "\r\n")
 			buf = buf[:0]
 			pos = 0
 			return "", &interruptError{}
@@ -122,7 +127,7 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 		// Ctrl+D on empty line
 		case b[0] == 4:
 			if len(buf) == 0 {
-				fmt.Fprintln(os.Stdout)
+				fmt.Fprint(os.Stdout, "\r\n")
 				return "", io.EOF
 			}
 			// Delete current character.
@@ -182,8 +187,8 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 					pos = len([]rune(head + completions[0]))
 					rl.redrawLine(prompt, buf, pos)
 				} else if len(completions) > 1 {
-					fmt.Fprintln(os.Stdout)
-					fmt.Fprintln(os.Stdout, strings.Join(completions, "  "))
+					fmt.Fprint(os.Stdout, "\r\n")
+					fmt.Fprint(os.Stdout, strings.Join(completions, "  ")+"\r\n")
 					rl.redrawLine(prompt, buf, pos)
 				}
 			}

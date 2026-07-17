@@ -47,6 +47,17 @@ type Manager struct {
 // New creates a new package manager.
 // pkgPrefix is the directory used as dpkg's instdir (e.g., layerMgr.PkgRootDir()).
 func New(layerMgr *fs.LayerManager, sessionID, pkgPrefix string) *Manager {
+	// The pkg manager runs post-pivot with cwd = the guest home, which is the
+	// persistent/home layer. A relative pkgPrefix (e.g. ".local/share/ush/layers/
+	// persistent/pkgroot") would resolve against that home and make dpkg unpack into
+	// a doubly-nested pkgroot (persistent/home/.local/.../pkgroot), diverging from
+	// where bindPkgLayer mounts the pkgroot and setupUsr overlays it onto /usr (the
+	// guest root, "/"+relpath). The maintainer scripts then can't see the unpacked
+	// /usr/share (debconf's confmodule etc.) and configure fails. Anchor pkgPrefix to
+	// the guest root so dpkg's instdir and the /usr overlay point at the same pkgroot.
+	if pkgPrefix != "" && !filepath.IsAbs(pkgPrefix) {
+		pkgPrefix = "/" + pkgPrefix
+	}
 	m := &Manager{
 		layerMgr:  layerMgr,
 		sessionID: sessionID,
@@ -134,10 +145,14 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 	// assemble the apt-get call
 	// APT::Sandbox::User=root disables apt's privilege drop toward _apt
 	// (uid 42), which fails in user namespace.
-	// --instdir redirects package files to pkgPrefix (dedicated path outside
-	// the read-only /usr of the guest, so they can be found at standard hardcoded paths).
-	// --admindir=/var/lib/dpkg maintains the guest's dpkg database for
-	// dependency resolution.
+	// --instdir=/ makes dpkg write THROUGH the guest's /usr overlay (fuse-overlayfs,
+	// upperdir=pkgroot/usr). With the subordinate id range mapped, the rootless
+	// overlay can copy-up: every file/dir dpkg creates enters the upper in a way the
+	// overlay KNOWS, so it is visible at its absolute /usr path the same session, to
+	// libc reads AND the kernel's execve (debconf's confmodule/frontend resolve).
+	// Writing behind the overlay (--instdir=pkgroot + the shim /usr redirect) left new
+	// dirs and in-both files unmerged and broke maintainer scripts; write-through
+	// removes that failure mode at the root. --admindir keeps the dpkg db on pkgroot.
 	// --force-script-chrootless executes maintainer scripts in the current environment
 	// rather than chrooting into instdir.
 	aptArgs := []string{
@@ -163,7 +178,7 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 		} else {
 			aptArgs = append(aptArgs[:len(aptArgs)-2],
 				"--reinstall",
-				"-o", fmt.Sprintf("Dpkg::Options::=--instdir=%s", m.pkgPrefix),
+				"-o", "Dpkg::Options::=--instdir=/",
 				"-o", fmt.Sprintf("Dpkg::Options::=--admindir=%s", adminDir),
 				// Point apt's own status view at the pkgroot database so that
 				// dependency resolution uses ONLY packages we've installed into
@@ -315,7 +330,7 @@ func (m *Manager) Fix(ctx context.Context, stdout, stderr io.Writer) error {
 			ushlog.Warn("pkg: unable to create pkgPrefix admindir", "err", err)
 		} else {
 			aptArgs = append(aptArgs,
-				"-o", fmt.Sprintf("Dpkg::Options::=--instdir=%s", m.pkgPrefix),
+				"-o", "Dpkg::Options::=--instdir=/",
 				"-o", fmt.Sprintf("Dpkg::Options::=--admindir=%s", adminDir),
 				"-o", fmt.Sprintf("Dir::State::status=%s/status", adminDir),
 				"-o", "Dpkg::Options::=--force-script-chrootless",
@@ -346,7 +361,7 @@ func (m *Manager) fixDirectDpkg(ctx context.Context, stdout, stderr io.Writer) e
 		adminDir, err := ensurePkgAdminDir(m.pkgPrefix)
 		if err == nil {
 			args = append(args,
-				"--instdir="+m.pkgPrefix,
+				"--instdir=/",
 				"--admindir="+adminDir,
 				"--force-script-chrootless",
 				"--no-triggers",
@@ -652,6 +667,12 @@ func aptSecurityFlags() []string {
 		"-o", "Dir::Etc::trusted=/dev/null",
 		"-o", "Dir::Etc::trustedparts=/dev/null",
 		"-o", "Dir::Etc::sourceparts=/dev/null",
+		// The image ships no /etc/apt/apt.conf.d or /etc/apt/preferences.d; point
+		// both parts dirs at /dev/null so apt neither warns about the missing dirs
+		// (DirectoryExists) nor honours any planted drop-in -- same fail-closed
+		// stance as the source/trusted parts above.
+		"-o", "Dir::Etc::parts=/dev/null",
+		"-o", "Dir::Etc::preferencesparts=/dev/null",
 		// Pin the source list too: a command-line -o outranks any apt.conf.d or
 		// APT_CONFIG file, so apt reads only our verified sources.list even if
 		// something tries to redirect Dir::Etc::sourcelist elsewhere.
@@ -674,12 +695,25 @@ func cleanAptEnv() []string {
 	return out
 }
 
+// aptStateDir is a writable path for apt's lists/cache/log, independent of where
+// the apt binaries live. The pre-baked tools tree ships read-only in the image,
+// so apt-state must not sit beside it; the ush home layer is always writable.
+func aptStateDir() string {
+	if home := os.Getenv("HOME"); home != "" {
+		return filepath.Join(home, ".local", "share", "ush", "apt-state")
+	}
+	// No HOME (unusual): fall back to the guest tmpfs, still writable.
+	return "/run/ush/apt-state"
+}
+
 // runApt executes apt-get inside the guest with security flags.
 func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...string) error {
 	// Lead with the unconditional security hardening so it applies whether or not
 	// the bootstrapped-tools branch is taken.
 	args = append(aptSecurityFlags(), args...)
-	ushlog.Info("pkg: apt-get", "args", args)
+	// Debug, not Info: the logger writes to the user's terminal, and the full
+	// flag list is a screenful of JSON in the middle of an ordinary install.
+	ushlog.Debug("pkg: apt-get", "args", args)
 
 	// Verify apt-get is available - bootstrap may have failed on first run.
 	aptBin := findAptBin("apt-get")
@@ -800,7 +834,11 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// create its lists/archives there ("List directory .../partial is missing").
 		// Redirect apt's state and cache to a writable path under the ush home and
 		// pre-create the partial dirs apt downloads into.
-		aptState := filepath.Join(filepath.Dir(toolsDir), "apt-state")
+		// Derive it from the ush home, NOT from toolsDir: a pre-baked tools tree
+		// lives in the read-only image (/usr/share/ush/tools), so a sibling
+		// apt-state there is unwritable and apt fails its update. The home layer
+		// is always writable.
+		aptState := aptStateDir()
 		os.MkdirAll(filepath.Join(aptState, "lists", "partial"), 0755)    //nolint:errcheck
 		os.MkdirAll(filepath.Join(aptState, "archives", "partial"), 0755) //nolint:errcheck
 		os.MkdirAll(filepath.Join(aptState, "log"), 0755)                 //nolint:errcheck
@@ -985,7 +1023,10 @@ func bindPkgShareDirs(pkgPrefix string) {
 		// userxattr not supported - try without it (older kernels).
 		opts = fmt.Sprintf("lowerdir=%s:/usr/share", srcBase)
 		if err := unix.Mount("overlay", "/usr/share", "overlay", 0, opts); err != nil {
-			ushlog.Warn("pkg: overlay /usr/share failed", "err", err)
+			// Expected inside the unprivileged guest (no CAP_SYS_ADMIN post-setup):
+			// package data dirs stay reachable via the pkgroot in PATH, so this is a
+			// non-fatal best-effort. Log at debug so it does not alarm the user.
+			ushlog.Debug("pkg: /usr/share overlay unavailable (data dirs via pkgroot PATH)", "err", err)
 		}
 	}
 }

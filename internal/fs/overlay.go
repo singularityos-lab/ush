@@ -127,6 +127,11 @@ func (g *GuestFS) Setup() error {
 	if err := g.setupUsr(); err != nil {
 		return err
 	}
+	// Expose /bin/bash so Debian packages' #!/bin/bash scripts can exec (bash is
+	// Essential, so apt never installs it; the base is BusyBox-only).
+	if err := g.setupBinBash(); err != nil {
+		return err
+	}
 	if err := g.applyExtraBinds(); err != nil {
 		return err
 	}
@@ -314,6 +319,68 @@ func (g *GuestFS) bindRODirs() error {
 	return nil
 }
 
+// setupBinBash exposes a real bash at the absolute /bin/bash that Debian package
+// maintainer scripts and installed programs assume (#!/bin/bash). The Sinty base
+// /bin is BusyBox-only and bind-mounted read-only, so overlay /bin with a writable
+// upper carrying a bash staged from ToolsDir. bash's Debian shared libs (libc,
+// libtinfo) resolve via the same guest-leading LD_LIBRARY_PATH the apt tools use,
+// inherited by anything the shell execs. Best-effort: on any failure the guest
+// keeps its BusyBox /bin so /bin/sh scripts still work.
+func (g *GuestFS) setupBinBash() error {
+	if g.ToolsDir == "" {
+		return nil
+	}
+	var bashSrc string
+	for _, p := range []string{
+		filepath.Join(g.ToolsDir, "bin", "bash"),
+		filepath.Join(g.ToolsDir, "usr", "bin", "bash"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			bashSrc = p
+			break
+		}
+	}
+	if bashSrc == "" {
+		return nil // bash not bootstrapped; nothing to expose
+	}
+	data, err := os.ReadFile(bashSrc)
+	if err != nil {
+		return nil
+	}
+	upper := filepath.Join(g.LayerDir, ".bin-overlay-upper")
+	work := filepath.Join(g.LayerDir, ".bin-overlay-work")
+	if err := os.MkdirAll(upper, 0o755); err != nil {
+		return nil
+	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(upper, "bash"), data, 0o755); err != nil {
+		return nil
+	}
+	dst := filepath.Join(g.GuestRoot, "bin")
+	opts := fmt.Sprintf("lowerdir=/bin,upperdir=%s,workdir=%s,userxattr", upper, work)
+	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
+		ushlog.Info("fs: /bin overlaid with bash (#!/bin/bash scripts runnable)")
+		return nil
+	}
+	opts = fmt.Sprintf("lowerdir=/bin,upperdir=%s,workdir=%s", upper, work)
+	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
+		ushlog.Info("fs: /bin overlaid with bash")
+		return nil
+	} else {
+		ushlog.Info("fs: /bin kernel overlay unavailable, trying fuse-overlayfs", "err", err)
+	}
+	// Same overlay-root constraint as /usr: on Sinty the kernel driver refuses, so
+	// #!/bin/bash scripts would not run. fuse-overlayfs merges bash over BusyBox /bin.
+	if g.fuseOverlay("/bin", "/bin", upper, filepath.Join(g.LayerDir, ".bin-fuse-work"), dst) {
+		ushlog.Info("fs: /bin overlaid with bash via fuse-overlayfs (#!/bin/bash scripts runnable)")
+		return nil
+	}
+	ushlog.Warn("fs: /bin bash overlay failed (bash scripts may not run)")
+	return nil
+}
+
 // setupUsr is a no-op: /usr is bind-mounted RO by bindRODirs().
 // Packages are installed into pkgPrefix (via dpkg --instdir) instead
 // of /usr, so /usr can stay read-only.
@@ -342,6 +409,10 @@ func (g *GuestFS) setupUsr() error {
 		return nil
 	}
 	pkgUsr := filepath.Join(pkgroot, "usr")
+	// No pre-mount seeding: dpkg installs with --instdir=/ and the subuid range lets
+	// the rootless overlay copy-up, so every installed file (perl-base included) is
+	// written THROUGH the overlay and visible at its absolute /usr path the same
+	// session. Seeding into the raw upper behind the overlay was the old failure mode.
 	dst := filepath.Join(g.GuestRoot, "usr")
 	work := filepath.Join(pkgroot, ".usr-overlay-work")
 	if err := os.MkdirAll(work, 0o755); err != nil {
@@ -350,21 +421,88 @@ func (g *GuestFS) setupUsr() error {
 	}
 	ushlog.Info("fs: /usr overlay pkgroot resolved", "pkgroot", pkgroot, "guest", pkgroot == guestPkgroot)
 	ushlog.Info("fs: overlaying /usr with pkgroot", "lower", "/usr", "upper", pkgUsr, "work", work, "dst", dst)
+
+	// Prefer fuse-overlayfs for /usr, not the kernel driver. dpkg installs into
+	// pkgUsr, which IS this overlay's upperdir, and then runs maintainer scripts
+	// (--force-script-chrootless) that read those files back at absolute /usr paths
+	// within the SAME session. The kernel overlay caches its merged view and does
+	// not reliably reflect files written straight into the upperdir while mounted
+	// (the kernel docs call modifying an overlay's underlying dirs undefined): so
+	// debconf.postinst sources /usr/share/debconf/confmodule, just unpacked into
+	// the upper, and gets ENOENT, aborting every install with a maintainer script.
+	// fuse-overlayfs looks up the upperdir live on each access, so the just-written
+	// file is visible. It ships in the base image and opens /dev/fuse before pivot.
+	if g.fuseOverlay("/usr", "/usr", pkgUsr, filepath.Join(pkgroot, ".usr-fuse-work"), dst) {
+		ushlog.Info("fs: /usr overlaid with pkgroot via fuse-overlayfs (write-through: installed files visible same session)")
+		return nil
+	}
+
+	// Fallback: kernel overlay. Good enough for reading installed files (binaries,
+	// libs); only the write-then-read-same-session pattern of maintainer scripts is
+	// unreliable on it, so this path keeps simple installs working when fuse is absent.
+	ushlog.Info("fs: /usr fuse-overlayfs unavailable, falling back to kernel overlay")
 	opts := fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s,userxattr", pkgUsr, work)
 	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
-		ushlog.Info("fs: /usr overlaid with pkgroot (dev headers/libs at absolute paths)")
+		ushlog.Info("fs: /usr overlaid with pkgroot (kernel, userxattr)")
 		return nil
 	} else {
 		ushlog.Info("fs: /usr overlay (userxattr) failed, retrying without", "err", err)
 	}
 	opts = fmt.Sprintf("lowerdir=/usr,upperdir=%s,workdir=%s", pkgUsr, work)
 	if err := unix.Mount("overlay", dst, "overlay", 0, opts); err == nil {
-		ushlog.Info("fs: /usr overlaid with pkgroot")
+		ushlog.Info("fs: /usr overlaid with pkgroot (kernel)")
 		return nil
 	} else {
-		ushlog.Warn("fs: /usr pkgroot overlay unavailable, keeping bind-RO /usr (dev compile disabled)", "upper", pkgUsr, "work", work, "err", err)
+		ushlog.Info("fs: /usr kernel overlay unavailable", "err", err)
 	}
+	ushlog.Warn("fs: /usr pkgroot overlay unavailable, keeping bind-RO /usr (pkg install of packages with maintainer scripts will fail)", "upper", pkgUsr, "dst", dst)
 	return nil
+}
+
+// overlayUsrSubdir stacks a dedicated fuse-overlayfs on /usr/<sub> (bin, sbin) over
+// the big /usr overlay, using pkgroot/usr/<sub> as its upper so installed binaries
+// sit at that overlay's upper ROOT and are surfaced in the merged view (the big
+// /usr overlay leaves in-both subdir upper files invisible). Mirrors setupBinBash.
+// Best-effort: on failure the guest keeps the big /usr overlay's /usr/<sub>.
+func (g *GuestFS) overlayUsrSubdir(pkgroot, pkgUsr, sub string) {
+	upper := filepath.Join(pkgUsr, sub)
+	if err := os.MkdirAll(upper, 0o755); err != nil {
+		return
+	}
+	dst := filepath.Join(g.GuestRoot, "usr", sub)
+	work := filepath.Join(pkgroot, ".usr"+sub+"-fuse-work")
+	if g.fuseOverlay("/usr/"+sub, "/usr/"+sub, upper, work, dst) {
+		ushlog.Info("fs: /usr/"+sub+" dedicated overlay (installed binaries visible in merged view)", "upper", upper)
+	}
+}
+
+// fuseOverlay merges upper over lower at dst using fuse-overlayfs, the user-space
+// overlay. It runs unprivileged in the guest and succeeds where the in-kernel
+// overlay driver returns EPERM on an overlay-root host (Sinty's immutable
+// erofs+dm-verity+tmpfs). label names the mountpoint for logs. Returns true when
+// the merged tree is mounted.
+func (g *GuestFS) fuseOverlay(label, lower, upper, work, dst string) bool {
+	bin, err := exec.LookPath("fuse-overlayfs")
+	if err != nil {
+		// PATH may be minimal during setup; fall back to the image's fixed path.
+		if _, statErr := os.Stat("/usr/bin/fuse-overlayfs"); statErr != nil {
+			ushlog.Warn("fs: fuse-overlayfs not found", "mount", label, "err", err)
+			return false
+		}
+		bin = "/usr/bin/fuse-overlayfs"
+	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		ushlog.Warn("fs: fuse-overlayfs workdir failed", "mount", label, "work", work, "err", err)
+		return false
+	}
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work)
+	out, err := exec.Command(bin, "-o", opts, dst).CombinedOutput()
+	if err != nil {
+		ushlog.Warn("fs: fuse-overlayfs failed", "mount", label,
+			"err", err, "out", strings.TrimSpace(string(out)))
+		return false
+	}
+	return true
 }
 
 // setupEtc populates the guest /etc from the host by copying into a tmpfs so
@@ -495,6 +633,27 @@ func ensureDebianSources(aptDir string) bool {
 		if changed {
 			ushlog.Info("fs: sources.list.d purged (extra/host repos removed)")
 		}
+	}
+
+	// apt.conf.d must exist and be empty. apt loads it while initialising its
+	// config, before it parses the command line, so Dir::Etc::parts=/dev/null
+	// arrives too late to suppress either the drop-ins or the
+	// "Unable to read /etc/apt/apt.conf.d/ - DirectoryExists" warning on every
+	// install. Existing entries get the sources.list.d treatment: they are read
+	// ahead of our -o flags and could set what those do not pin (e.g.
+	// APT::Get::AllowUnauthenticated).
+	confD := filepath.Join(aptDir, "apt.conf.d")
+	if entries, err := os.ReadDir(confD); err == nil {
+		for _, e := range entries {
+			p := filepath.Join(confD, e.Name())
+			if rerr := os.RemoveAll(p); rerr != nil {
+				if werr := os.WriteFile(p, nil, 0644); werr != nil {
+					ushlog.Warn("fs: SECURITY could not purge apt.conf.d entry", "path", p, "err", werr)
+				}
+			}
+		}
+	} else if err := os.MkdirAll(confD, 0755); err != nil {
+		ushlog.Warn("fs: unable to create apt.conf.d", "path", confD, "err", err)
 	}
 
 	// Keep an existing sources.list ONLY if EVERY deb/deb-src line is verified
@@ -666,7 +825,99 @@ func fixResolvConf(path string) {
 	ushlog.Debug("fs: resolv.conf written with public DNS")
 }
 
+// seedUsrSkeleton creates a generous FHS directory skeleton inside the pkgroot
+// (the /usr overlay's upperdir) BEFORE the overlay is mounted. Any directory
+// present in the upper at mount time is part of the merged view, so the raw files
+// dpkg (and the LD_PRELOAD shim that redirects the maintainer scripts' /usr writes
+// to pkgroot) later write into these dirs are visible at the absolute /usr path in
+// the same session. Without this, a package that installs into a directory the
+// busybox base lacks (e.g. /usr/share/debconf) creates that dir behind the mounted
+// overlay, which the merged view never surfaces, so the maintainer script's read of
+// /usr/share/debconf/confmodule (or exec of frontend) fails. The critical entry is
+// /usr/share/debconf; the rest cover the common install targets. A package that
+// creates a genuinely new deep dir not listed here still lands invisible (the known
+// bound of this approach), but the files maintainer scripts read back in-session
+// almost always live under /usr/share/debconf, which is covered.
+func (g *GuestFS) seedUsrSkeleton(pkgUsr string) {
+	dirs := []string{
+		"share/debconf",
+		"lib", "lib/x86_64-linux-gnu", "bin", "sbin", "include",
+		"share", "share/doc", "share/man", "share/locale", "share/fontconfig",
+		"share/applications", "share/icons", "share/misc", "share/pkgconfig",
+	}
+	for _, d := range dirs {
+		os.MkdirAll(filepath.Join(pkgUsr, d), 0o755) //nolint:errcheck
+	}
+	ushlog.Info("fs: seeded FHS skeleton into pkgroot/usr (maintainer scripts see files in pre-existing dirs)")
+}
+
 // copyFileIfExists copies src to dst if src exists; ignores errors.
+// seedPerlBase copies the staged perl-base interpreter and its module tree from
+// the tools dir into the pkgroot upper (pkgUsr), so /usr/bin/perl exists in the
+// guest. debconf's frontend is a #!/usr/bin/perl script and every debconf
+// maintainer script sources it; without perl they die with exit 127. perl-base
+// alone suffices: debconf declares it as its only dependency and its Debconf::
+// modules ship with the debconf package installed into the same pkgroot.
+func (g *GuestFS) seedPerlBase(pkgUsr string) {
+	if g.ToolsDir == "" {
+		return
+	}
+	// seedPerlBase runs PRE-pivot (Setup's pivot_root is last), and bindRODirs
+	// mounted the base /usr (which carries the pre-baked tools tree) under
+	// GuestRoot/usr, not at the absolute /usr of the guest namespace (still empty
+	// pre-pivot). g.ToolsDir is an absolute path (/usr/share/ush/tools); read it
+	// GuestRoot-relative so the stat resolves against the mounted tools, exactly as
+	// pkgUsr (the write target) is already GuestRoot-relative.
+	toolsUsr := filepath.Join(g.GuestRoot, g.ToolsDir, "usr")
+	if _, err := os.Stat(filepath.Join(toolsUsr, "bin", "perl")); err != nil {
+		ushlog.Debug("fs: perl-base not staged in tools, /usr/bin/perl unavailable", "toolsUsr", toolsUsr)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(pkgUsr, "bin", "perl")); err == nil {
+		return // already seeded in a prior session (pkgroot persists)
+	}
+	seed := func(rel string) {
+		src := filepath.Join(toolsUsr, rel)
+		fi, err := os.Stat(src)
+		if err != nil {
+			return
+		}
+		dst := filepath.Join(pkgUsr, rel)
+		if fi.IsDir() {
+			os.MkdirAll(dst, 0o755) //nolint:errcheck
+			_ = copyDirContents(src, dst)
+		} else {
+			copyFileIfExists(src, dst)
+		}
+	}
+	// Interpreter: perl plus its versioned name/symlink.
+	if entries, err := os.ReadDir(filepath.Join(toolsUsr, "bin")); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "perl") {
+				seed(filepath.Join("bin", e.Name()))
+			}
+		}
+	}
+	// perl-base core modules under lib/<triplet>/perl-base, and any arch-indep
+	// perl module dir under share/perl*.
+	if libs, err := os.ReadDir(filepath.Join(toolsUsr, "lib")); err == nil {
+		for _, e := range libs {
+			pb := filepath.Join("lib", e.Name(), "perl-base")
+			if fi, err := os.Stat(filepath.Join(toolsUsr, pb)); err == nil && fi.IsDir() {
+				seed(pb)
+			}
+		}
+	}
+	if shares, err := os.ReadDir(filepath.Join(toolsUsr, "share")); err == nil {
+		for _, e := range shares {
+			if strings.HasPrefix(e.Name(), "perl") {
+				seed(filepath.Join("share", e.Name()))
+			}
+		}
+	}
+	ushlog.Info("fs: seeded perl-base into pkgroot (/usr/bin/perl for debconf)")
+}
+
 func copyFileIfExists(src, dst string) {
 	fi, err := os.Lstat(src)
 	if err != nil {
@@ -783,6 +1034,7 @@ func (g *GuestFS) setupVar() error {
 
 	// First try direct overlay on /var (works if /var is on tmpfs).
 	if err := g.setupOverlay("var"); err == nil {
+		ensureVarWritable(varDst)
 		return nil
 	}
 
@@ -843,6 +1095,35 @@ func (g *GuestFS) setupVar() error {
 	invalidateAptLists(varDst) //nolint:errcheck
 
 	return nil
+}
+
+// ensureVarWritable gives the guest a writable /var/log, /var/cache and /var/tmp
+// on the overlay path. The lower /var comes from the host rootfs, where these
+// dirs can be owned by an uid the guest userns does not map (Sinty ships
+// /var/log owned by "nobody"). The overlay copies them up preserving that owner,
+// and the guest's uid 0 has no CAP_CHOWN/CAP_DAC_OVERRIDE over an unmapped uid,
+// so a chown fails and a write gets EACCES: fontconfig.postinst writing
+// /var/log/fontconfig.log was the visible failure, cascading to debconf,
+// libglib2.0-0 and fontconfig-config all "Errors were encountered" and apt
+// exiting 100 even though every file had unpacked. A fresh tmpfs mounted here is
+// owned by the guest uid 0 and writable; these dirs hold only regenerable
+// session state (logs, caches, temp), so nothing is lost by shadowing the lower.
+// The tmpfs fallback path already creates a fresh /var, so it needs no fixup.
+func ensureVarWritable(varDst string) {
+	for _, d := range []string{"log", "cache", "tmp"} {
+		p := filepath.Join(varDst, d)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			ushlog.Debug("fs: ensure /var dir", "dir", d, "err", err)
+			continue
+		}
+		mode := "mode=0755"
+		if d == "tmp" {
+			mode = "mode=1777" // world-writable, like /tmp
+		}
+		if err := unix.Mount("tmpfs", p, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV, mode); err != nil {
+			ushlog.Debug("fs: tmpfs over /var/"+d+" failed", "err", err)
+		}
+	}
 }
 
 // bindHome mounts the user's home directory as read-write in the guest.
@@ -1001,8 +1282,15 @@ func (g *GuestFS) HostBackedRWGuestPaths() []string {
 // working; ush's policy/audit/layers state stays out of the guest.
 func (g *GuestFS) bindPkgLayer() error {
 	src := filepath.Join(g.LayerDir, "persistent", "pkgroot")
-	if _, err := os.Stat(src); err != nil {
-		return nil // nothing installed yet
+	// Create the pkgroot up front (even on a brand-new profile with nothing
+	// installed). It must exist so bindPkgLayer can bind it into the guest and
+	// setupUsr can overlay it onto /usr BEFORE the first `pkg install`: dpkg unpacks
+	// with instdir pointing here, and its maintainer scripts read those files back
+	// through the /usr overlay. Without pre-creating it the overlay was skipped and
+	// the first install always failed (debconf confmodule not found).
+	if err := os.MkdirAll(filepath.Join(src, "usr"), 0o755); err != nil {
+		ushlog.Debug("fs: pkgroot pre-create failed", "src", src, "err", err)
+		return nil
 	}
 	dst := filepath.Join(g.GuestRoot, src)
 	if err := os.MkdirAll(dst, 0755); err != nil {

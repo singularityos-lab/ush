@@ -175,6 +175,12 @@ type Server struct {
 	inflight   map[string]*inflightPermission
 	auto       *autoDecider // non-interactive decision mode (testing/CI)
 	storageDir string       // for the dsh opt-in marker (see internal/devpolicy)
+
+	// portalProbe bounds the first lookup of the DE permission Portal so a
+	// request arriving during session startup (before the shell has registered
+	// the Portal bus name) is not lost to the terminal fallback. See
+	// portalAvailable.
+	portalProbe sync.Once
 }
 
 type inflightPermission struct {
@@ -578,6 +584,17 @@ func (s *Server) requestDevShell() bool {
 		ushlog.Info("broker: dev shell request refused by policy")
 		return false
 	}
+	// Use the same permission dialog the desktop already answers (ShowPermission),
+	// not ShowConfirm: the Singularity portal implements the former (network
+	// prompts work through it) but not reliably the latter, so a ShowConfirm-based
+	// confirm fell through to a terminal prompt no one could answer and dsh could
+	// never be entered even once enabled. Any allow* verdict is a confirmation.
+	reason := "Open the developer environment (dsh). It unlocks containers, builds " +
+		"and open network, and is NOT a sandbox: code there runs on your real account."
+	if decision := s.portalDialog("devshell", "developer environment", reason); decision != "" {
+		return strings.HasPrefix(decision, "allow")
+	}
+	// No portal (headless/CI): fall back to the generic confirm (zenity/terminal).
 	return s.confirmDialog(
 		"USH - Open developer environment",
 		"Open the developer environment (dsh)?\n\n"+
@@ -740,6 +757,34 @@ func (s *Server) confirmDialog(title, msg string) bool {
 	return strings.EqualFold(strings.TrimSpace(answer), "yes")
 }
 
+// nameHasOwner reports whether a well-known bus name currently has an owner.
+func nameHasOwner(conn *dbus.Conn, name string) bool {
+	var has bool
+	err := conn.BusObject().Call("org.freedesktop.DBus.NameHasOwner", 0, name).Store(&has)
+	return err == nil && has
+}
+
+// portalAvailable reports whether the DE permission Portal is reachable on the
+// session bus. The first call blocks up to a few seconds waiting for the Portal
+// name to appear: a permission request can arrive during session startup, before
+// the shell has finished registering the Portal (its Bus.own_name is async), and
+// without this wait it would fall straight through to the terminal fallback (a
+// silent deny) even though the dialog is about to become available. The wait runs
+// once (sync.Once): if the Portal never appears (headless/CI) later requests are
+// not delayed, and auto mode short-circuits before ever reaching here.
+func (s *Server) portalAvailable(conn *dbus.Conn) bool {
+	s.portalProbe.Do(func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for !nameHasOwner(conn, PortalBusName) {
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	})
+	return nameHasOwner(conn, PortalBusName)
+}
+
 // portalConfirm asks the desktop portal to render a yes/no confirmation via
 // io.github.singularityos_lab.ush.Portal1.ShowConfirm. served is false when the portal
 // is unavailable, so the caller falls back to zenity/kdialog/terminal.
@@ -749,6 +794,9 @@ func (s *Server) portalConfirm(title, body string) (result bool, served bool) {
 		return false, false
 	}
 	defer conn.Close()
+	if !s.portalAvailable(conn) {
+		return false, false
+	}
 	obj := conn.Object(PortalBusName, dbus.ObjectPath(PortalObjPath))
 	call := obj.Call(PortalInterface+".ShowConfirm", 0, title, body)
 	if call.Err != nil {
@@ -770,6 +818,9 @@ func (s *Server) portalDialog(category, resource, reason string) string {
 		return ""
 	}
 	defer conn.Close()
+	if !s.portalAvailable(conn) {
+		return ""
+	}
 
 	obj := conn.Object(PortalBusName, dbus.ObjectPath(PortalObjPath))
 	var decision string

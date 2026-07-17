@@ -67,7 +67,12 @@ func Defaults() *Config {
 		OverlayBackend:     "kernel",
 		EnablePIDNamespace: true,
 		EnableNetNamespace: true,
-		LogLevel:           "info",
+		// The logger writes to the user's terminal, so anything above error puts
+		// internal JSON in the middle of ordinary commands. "info" here also
+		// silently defeated the quiet-unless-verbose default in cmd/ush: every
+		// user gets this value, so the else-if that honours a configured level
+		// always fired. -v still selects info.
+		LogLevel: "error",
 	}
 }
 

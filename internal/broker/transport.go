@@ -49,6 +49,7 @@ type rpcRequest struct {
 	Reason    string `json:"reason,omitempty"`
 	SessionID string `json:"session,omitempty"`
 	App       string `json:"app,omitempty"`
+	Enable    bool   `json:"enable,omitempty"`
 }
 
 // rpcResponse is the broker's reply.
@@ -57,6 +58,8 @@ type rpcResponse struct {
 	Trusted     bool   `json:"trusted,omitempty"`
 	Permissions string `json:"permissions,omitempty"`
 	Error       string `json:"error,omitempty"`
+	Policy      string `json:"policy,omitempty"`
+	Enabled     bool   `json:"enabled,omitempty"`
 }
 
 // writeMessage marshals v to JSON and writes it as a single newline-terminated
@@ -80,6 +83,13 @@ func readMessage(r *bufio.Reader, v interface{}) error {
 }
 
 const dialDeadline = 12 * time.Second
+
+// permissionReadDeadline bounds the read of an interactive permission reply. The
+// broker only answers after the user acts on the dialog, so the wait must cover
+// human response time (reading the prompt, deciding, clicking) plus first-boot
+// dialog-render latency -- the short dialDeadline used for dial/write would time
+// the read out mid-dialog and surface as a spurious "network access denied".
+const permissionReadDeadline = 5 * time.Minute
 
 // serve accepts connections on the control socket. Each connection carries one
 // request and is handled in its own goroutine so a slow dialog for one request
@@ -141,6 +151,18 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 		return rpcResponse{Permissions: s.listDevDirs()}
 	case "RequestDevShell":
 		return rpcResponse{Trusted: s.requestDevShell()}
+	case "DevShellStatus":
+		// The broker owns the host-side storage dir, so a guest-side `dsh status`
+		// reports the real opt-in state instead of the sandbox's ephemeral copy.
+		pol, enabled := s.devShellStatus()
+		return rpcResponse{Policy: pol, Enabled: enabled}
+	case "SetDevShellEnabled":
+		// Same reason: route the CLI toggle through the broker so the marker lands
+		// in host storage, where the dsh gate actually reads it.
+		if err := s.setDevShellEnabled(req.Enable); err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{}
 	case "ListPermissions":
 		perms, err := s.listPermissions()
 		if err != nil {

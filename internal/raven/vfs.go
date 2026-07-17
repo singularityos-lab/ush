@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Mirko Brombin <brombin94@gmail.com>
 
-// Package raven implements a userspace VFS (Virtual File System) with COW
-// (copy-on-write) overlay semantics. It can load layers from the real
-// filesystem and provide overlay-style read/write/delete operations
-// entirely in userspace.
-//
-// This is used for advanced layer inspection and as a foundation for
-// alternative backend implementations that do not depend on kernel overlayfs.
+// Package raven implements a userspace VFS with copy-on-write overlay
+// semantics: it loads layers from the real filesystem and offers overlay-style
+// read/write/delete operations entirely in userspace, without kernel overlayfs.
 package raven
 
 import (

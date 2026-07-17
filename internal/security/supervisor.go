@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -207,6 +208,7 @@ func (s *Supervisor) connectViaPidfd(n *seccompNotif, family uint16, ip net.IP, 
 //  4. This supervisor + exec whitelist - audit-grade restriction on unknown execs
 type Supervisor struct {
 	notifFd       int
+	closeOnce     sync.Once
 	whitelist     *ExecWhitelist
 	brokerClient  *broker.Client
 	permissive    atomic.Bool // when true: log denials but always continue
@@ -357,6 +359,14 @@ func (s *Supervisor) SetPermissive(v bool) {
 // concurrent syscalls (e.g. every connect() apt makes would stall otherwise).
 func (s *Supervisor) Run() {
 	ushlog.Info("security: seccomp supervisor started")
+	// The filter outlives this loop: it stays installed on every guest thread.
+	// So whatever ends the loop, the fd must be closed on the way out, which
+	// makes the kernel fail pending and future intercepted syscalls with ENOSYS.
+	// Leave it open and any thread that traps after this point sleeps in
+	// seccomp_do_user_notification forever with nobody to answer it: the shell
+	// wedges mid-command and not even Ctrl+C can free it, because the thread is
+	// blocked in the kernel rather than in userspace.
+	defer s.close()
 	defer ushlog.Info("security: seccomp supervisor stopped")
 
 	for {
@@ -368,6 +378,13 @@ func (s *Supervisor) Run() {
 			if errno == unix.EINTR {
 				continue
 			}
+			// A dropped notification (the target died, or was signalled out of
+			// its syscall) says nothing about the fd, so keep serving the ones
+			// still to come instead of tearing the whole supervisor down.
+			if errno == unix.ENOENT {
+				continue
+			}
+			ushlog.Warn("security: seccomp notif recv failed", "err", errno)
 			return // fd closed or fatal error
 		}
 
@@ -388,7 +405,13 @@ func (s *Supervisor) Run() {
 }
 
 // Stop closes the notification fd, causing Run to return.
-func (s *Supervisor) Stop() { unix.Close(s.notifFd) }
+func (s *Supervisor) Stop() { s.close() }
+
+// close is idempotent: both Stop and Run's teardown reach it, and closing a
+// raw fd twice could pick off an unrelated fd that reused the number.
+func (s *Supervisor) close() {
+	s.closeOnce.Do(func() { unix.Close(s.notifFd) })
+}
 
 // handleNotif dispatches a notification. The bool is true when the handler has
 // already responded to the notification itself (ADDFD_SEND path).

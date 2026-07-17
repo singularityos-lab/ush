@@ -133,7 +133,7 @@ func setupRoot(prof Profile, home, appHome string) error {
 		}
 	}
 
-	// /proc and /dev from the guest (no new pid namespace in phase 1).
+	// /proc and /dev from the guest (this jail does not create a new pid namespace).
 	_ = bind("/proc", filepath.Join(newRoot, "proc"), false)
 	_ = bind("/dev", filepath.Join(newRoot, "dev"), false)
 

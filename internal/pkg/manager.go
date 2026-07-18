@@ -145,16 +145,19 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 	// assemble the apt-get call
 	// APT::Sandbox::User=root disables apt's privilege drop toward _apt
 	// (uid 42), which fails in user namespace.
-	// --instdir=/ makes dpkg write THROUGH the guest's /usr overlay (fuse-overlayfs,
-	// upperdir=pkgroot/usr). With the subordinate id range mapped, the rootless
-	// overlay can copy-up: every file/dir dpkg creates enters the upper in a way the
-	// overlay KNOWS, so it is visible at its absolute /usr path the same session, to
-	// libc reads AND the kernel's execve (debconf's confmodule/frontend resolve).
-	// Writing behind the overlay (--instdir=pkgroot + the shim /usr redirect) left new
-	// dirs and in-both files unmerged and broke maintainer scripts; write-through
-	// removes that failure mode at the root. --admindir keeps the dpkg db on pkgroot.
-	// --force-script-chrootless executes maintainer scripts in the current environment
-	// rather than chrooting into instdir.
+	// --instdir=<pkgroot> makes dpkg write RAW into the pkgroot, which the guest owns:
+	// writable, no rootless copy-up, no write wall. Write-through to /usr (--instdir=/)
+	// is impossible here because the erofs /usr lower is owned by host root, unmapped in
+	// the guest (nobody), and fuse-overlayfs presents the in-both dir with that nobody
+	// owner, so even the guest cannot create a file in it (proven: idmap, xattr, squash
+	// all hit the same wall - the twin of the /var copy-up EACCES). Instead each
+	// top-level /usr/<X> is a dedicated per-subdir overlay (upper=pkgroot/usr/<X>) that
+	// surfaces the installed files at their absolute paths. The one thing the overlay
+	// cannot surface is a deep dir a package creates behind the mount and re-reads in
+	// session (debconf's Debconf:: modules) - handled by pre-seeding debconf as
+	// infrastructure (seedDebconfBase), so nothing debconf needs is installed behind the
+	// mount. --admindir keeps the dpkg db on pkgroot. --force-script-chrootless runs
+	// maintainer scripts in the current environment rather than chrooting into instdir.
 	aptArgs := []string{
 		"-o", "APT::Install-Recommends=false",
 		"-o", "Dpkg::Options::=--force-confold",
@@ -178,7 +181,7 @@ func (m *Manager) Install(ctx context.Context, stdout, stderr io.Writer, args []
 		} else {
 			aptArgs = append(aptArgs[:len(aptArgs)-2],
 				"--reinstall",
-				"-o", "Dpkg::Options::=--instdir=/",
+				"-o", fmt.Sprintf("Dpkg::Options::=--instdir=%s", m.pkgPrefix),
 				"-o", fmt.Sprintf("Dpkg::Options::=--admindir=%s", adminDir),
 				// Point apt's own status view at the pkgroot database so that
 				// dependency resolution uses ONLY packages we've installed into

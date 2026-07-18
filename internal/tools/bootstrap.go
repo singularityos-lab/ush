@@ -74,11 +74,19 @@ var requiredPackages = []pkgSpec{
 	// perl-base runs Debian debconf maintainer scripts. debconf's confmodule execs
 	// /usr/share/debconf/frontend (perl); the busybox base has no perl, so every
 	// package with a debconf postinst dies with exit 127. perl-base is Priority
-	// required and is the ONLY dependency debconf declares (its Debconf:: modules
-	// ship with the debconf package installed into the pkgroot), so it alone is
-	// enough with DEBIAN_FRONTEND=noninteractive. setupPerl exposes it at
-	// /usr/bin/perl in the guest.
+	// required. setupPerl exposes it at /usr/bin/perl in the guest.
 	{name: "perl-base", poolPath: "pool/main/p/perl"},
+	// debconf is INFRASTRUCTURE, not a package to install at runtime: maintainer
+	// scripts source /usr/share/debconf/confmodule and exec the perl frontend, which
+	// loads Debconf::* modules from /usr/share/perl5/Debconf. When debconf is only
+	// installed at runtime, those modules land BEHIND the rootless /usr overlay and
+	// are invisible in-session (the overlay never surfaces a deep dir written behind
+	// the mount), so `use Debconf::Db` dies "Can't locate" and every debconf postinst
+	// fails. Staging debconf into the tools tree (like perl-base) makes seedDebconfBase
+	// pre-populate the guest /usr with confmodule + frontend + Debconf modules BEFORE
+	// the overlay mounts, so they are present and visible. Pure-perl, only dep is
+	// perl-base. Used with DEBIAN_FRONTEND=noninteractive.
+	{name: "debconf", poolPath: "pool/main/d/debconf"},
 	// perl links libcrypt.so.1, which the Sinty base does not ship (libc/libm it
 	// does). Stage it like libtinfo6 for bash; it lands in the guest lib path so
 	// the /usr/bin/perl seeded from perl-base resolves it.

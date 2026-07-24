@@ -31,6 +31,7 @@ const (
 type Client struct {
 	socket    string
 	sessionID string
+	origin    string
 }
 
 // NewClient creates a new broker client pointed at the private control socket.
@@ -38,6 +39,19 @@ func NewClient(sessionID string) (*Client, error) {
 	return &Client{
 		socket:    SocketPath(),
 		sessionID: sessionID,
+	}, nil
+}
+
+// NewClientForOrigin creates a client whose requests are attributed to origin
+// (see SDBOrigin). It is for a relay that asks on behalf of somewhere else: the
+// debug bridge daemon uses it so the user approving an action is told the action
+// was requested remotely and by which paired host. The origin can only narrow
+// what the broker will do, so it is never a way to gain access.
+func NewClientForOrigin(sessionID, origin string) (*Client, error) {
+	return &Client{
+		socket:    SocketPath(),
+		sessionID: sessionID,
+		origin:    origin,
 	}, nil
 }
 
@@ -82,6 +96,7 @@ func (c *Client) RequestPermission(category, resource, reason string) (Decision,
 		Resource:  resource,
 		Reason:    reason,
 		SessionID: c.sessionID,
+		Origin:    c.origin,
 	}, permissionReadDeadline)
 	if err != nil {
 		ushlog.Warn("broker client: permission request failed", "err", err)
@@ -197,6 +212,46 @@ func (c *Client) SetDevShellEnabled(on bool) error {
 		return fmt.Errorf("broker: %s", resp.Error)
 	}
 	return nil
+}
+
+// BootloaderLockState reads the bootloader lock state through the broker, which
+// reaches the privileged recovery agent the desktop user cannot open itself.
+func (c *Client) BootloaderLockState() (LockState, error) {
+	resp, err := c.call(rpcRequest{Method: "BootloaderLockState"})
+	if err != nil {
+		return LockState{}, fmt.Errorf("broker: lock state: %w", err)
+	}
+	if resp.Error != "" {
+		return LockState{}, fmt.Errorf("broker: %s", resp.Error)
+	}
+	return LockState{
+		Locked:      resp.Locked,
+		UnlockArmed: resp.UnlockArmed,
+		UnlockCount: resp.UnlockCount,
+	}, nil
+}
+
+// SetBootloaderUnlockArmed arms or disarms bootloader-unlock consent. Arming
+// requires the user's PIN, which the broker verifies through sinty-recoverd;
+// disarming ignores it and an empty string is correct there. Arming is refused
+// outright when the client carries a remote origin.
+func (c *Client) SetBootloaderUnlockArmed(armed bool, pin string) (string, error) {
+	resp, err := c.callTimeout(rpcRequest{
+		Method: "SetBootloaderUnlockArmed",
+		Enable: armed,
+		PIN:    pin,
+		Origin: c.origin,
+	}, permissionReadDeadline)
+	if err != nil {
+		return "", fmt.Errorf("broker: arm unlock: %w", err)
+	}
+	if resp.Error != "" {
+		return resp.Message, fmt.Errorf("broker: %s", resp.Error)
+	}
+	if !resp.OK {
+		return resp.Message, fmt.Errorf("broker: arm unlock did not succeed")
+	}
+	return resp.Message, nil
 }
 
 // IsAppTrusted checks if an app has blanket permission.

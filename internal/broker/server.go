@@ -117,6 +117,60 @@ func (d *dbusManager) SetDevShellEnabled(enabled bool) *dbus.Error {
 	return nil
 }
 
+// ArmBootloaderUnlock and BootloaderLockState back the desktop Settings toggle
+// for allowing bootloader unlock. They are a thin surface over the same guarded
+// internals the control socket uses (see bootloader.go): the gates live there,
+// not here, so the two transports cannot drift apart.
+//
+// The management bus is reachable only by host session processes (the guest has
+// no access to it), which is the same reasoning that lets TrustDirConfirmed skip
+// a dialog. It is NOT the reasoning that lets this skip the PIN: any process in
+// the user's session can reach this bus, so the PIN is what proves the caller is
+// the owner, and it is verified on every arm.
+func (d *dbusManager) ArmBootloaderUnlock(armed bool, pin string) (bool, string, *dbus.Error) {
+	reply, err := d.s.setBootloaderUnlockArmed(armed, pin, Origin{}, sessionBusPeer())
+	if err != nil {
+		msg := reply.Message
+		if msg == "" {
+			msg = err.Error()
+		}
+		return false, msg, nil
+	}
+	return true, reply.Message, nil
+}
+
+func (d *dbusManager) BootloaderLockState() (bool, bool, int32, *dbus.Error) {
+	st, err := d.s.bootloaderLockState()
+	if err != nil {
+		return false, false, 0, dbus.MakeFailedError(err)
+	}
+	return st.Locked, st.UnlockArmed, int32(st.UnlockCount), nil
+}
+
+// SdbStatus and SetSdbEnabled back the desktop Settings control for the debug
+// bridge. Like the bootloader methods they are a thin surface over the guarded
+// internals in sdb.go, so both transports enforce the same rules, including the
+// observed-state invariant documented there.
+func (d *dbusManager) SdbStatus() (bool, bool, string, *dbus.Error) {
+	available, active, message := d.s.sdbStatus()
+	return available, active, message, nil
+}
+
+func (d *dbusManager) SetSdbEnabled(enabled bool) (bool, bool, string, *dbus.Error) {
+	ok, active, message := d.s.setSdbEnabled(enabled, Origin{}, sessionBusPeer())
+	return ok, active, message, nil
+}
+
+// sessionBusPeer is the identity of a management-bus caller. A session bus
+// connection is same-uid by construction: the bus socket lives in the user's
+// runtime dir and only that user can connect to it, so the peer is the broker's
+// own user. This is asserted rather than read because the exported signatures
+// carry no sender, and it is safe only because the PIN, not the peer check, is
+// the gate that stands between a session process and arming.
+func sessionBusPeer() peerIdentity {
+	return peerIdentity{known: true, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), pid: int32(os.Getpid())}
+}
+
 // StartManagementBus registers the host-only management interface on the session
 // bus. Best-effort: in a headless environment with no session bus it just logs
 // and returns; the socket transport keeps working regardless.
@@ -160,6 +214,28 @@ var managementIntrospectXML = `
       <arg name="enabled" type="b" direction="out"/>
     </method>
     <method name="SetDevShellEnabled"><arg name="enabled" type="b" direction="in"/></method>
+    <method name="ArmBootloaderUnlock">
+      <arg name="armed" type="b" direction="in"/>
+      <arg name="pin" type="s" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="BootloaderLockState">
+      <arg name="locked" type="b" direction="out"/>
+      <arg name="unlockArmed" type="b" direction="out"/>
+      <arg name="unlockCount" type="i" direction="out"/>
+    </method>
+    <method name="SdbStatus">
+      <arg name="available" type="b" direction="out"/>
+      <arg name="active" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="SetSdbEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="active" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
   </interface>
   <interface name="org.freedesktop.DBus.Introspectable">
     <method name="Introspect"><arg name="xml_data" type="s" direction="out"/></method>
@@ -242,15 +318,30 @@ func (s *Server) Stop() {
 }
 
 // requestPermission returns the decision: "allow", "deny", "allow_session",
-// "allow_always".
+// "allow_always". It is the local control-socket entry point.
 func (s *Server) requestPermission(
 	category, resource, reason, sessionID string,
+) string {
+	return s.requestPermissionFrom(category, resource, reason, sessionID, Origin{})
+}
+
+// requestPermissionFrom is requestPermission with the origin of the request
+// attached. A remote origin (see origin.go) is answered by the user for that
+// single action: it never reads a cached grant, never joins a local in-flight
+// prompt, and never leaves a rule behind.
+func (s *Server) requestPermissionFrom(
+	category, resource, reason, sessionID string, origin Origin,
 ) string {
 	ushlog.Info("broker: permission request",
 		"category", category,
 		"resource", resource,
 		"session", sessionID,
+		"origin", origin.auditValue(),
 	)
+
+	if origin.Remote {
+		return s.requestRemotePermission(category, resource, reason, sessionID, origin)
+	}
 
 	if decision, ok := s.policy.Check(policy.Category(category), resource); ok {
 		s.auditLog.Write(AuditEntry{
@@ -337,6 +428,76 @@ func (s *Server) requestPermission(
 
 	ushlog.Info("broker: user decision", "decision", decision)
 	return decision
+}
+
+// requestRemotePermission answers a request that did not start on this machine.
+// The rules are deliberately narrower than the local path and never wider:
+//
+//   - no policy-cache lookup, so an "always allow" the user granted to a local
+//     action cannot silently answer for a remote one
+//   - no in-flight coalescing, for the same reason: a local prompt's verdict is
+//     not a verdict about a remote request
+//   - no persistence, so a remote action can never widen the stored policy; every
+//     remote action is asked again
+//   - the resource shown is the exact one requested, not a widened scope, because
+//     nothing is being cached and the user is approving this one action
+//   - in non-interactive (auto) mode there is no user to attribute the request to,
+//     so it is refused instead of scripted
+func (s *Server) requestRemotePermission(
+	category, resource, reason, sessionID string, origin Origin,
+) string {
+	dialogReason := remoteReason(reason, origin)
+
+	if s.auto != nil && s.auto.enabled {
+		ushlog.Warn("broker: remote permission refused, no user present to approve it",
+			"category", category, "resource", resource, "origin", origin.auditValue())
+		s.auditLog.Write(AuditEntry{
+			Timestamp: time.Now(),
+			SessionID: sessionID,
+			Category:  category,
+			Resource:  resource,
+			Decision:  "deny",
+			Source:    "remote_no_user",
+			Origin:    origin.auditValue(),
+			Reason:    dialogReason,
+		})
+		return "deny"
+	}
+
+	decision := s.showDialog(category, resource, dialogReason)
+	switch decision {
+	case "allow", "allow_session", "allow_always":
+		decision = "allow"
+	default:
+		decision = "deny"
+	}
+
+	s.auditLog.Write(AuditEntry{
+		Timestamp: time.Now(),
+		SessionID: sessionID,
+		Category:  category,
+		Resource:  resource,
+		Decision:  decision,
+		Source:    "remote_user_dialog",
+		Origin:    origin.auditValue(),
+		Reason:    dialogReason,
+	})
+
+	ushlog.Info("broker: user decision on remote request",
+		"decision", decision, "origin", origin.auditValue())
+	return decision
+}
+
+// remoteReason puts the remote banner first, so the fact that the action was not
+// started on this machine is the first thing read and cannot be pushed out of
+// view by a long caller-supplied reason.
+func remoteReason(reason string, origin Origin) string {
+	banner := origin.banner()
+	detail := "Approving grants this one action only. It is not remembered."
+	if reason == "" {
+		return banner + "\n\n" + detail
+	}
+	return banner + "\n\n" + reason + "\n\n" + detail
 }
 
 func (s *Server) waitForInflightPermission(category, resource string, scope policy.Scope, sessionID string) (string, bool) {
@@ -923,6 +1084,7 @@ type AuditEntry struct {
 	Decision  string    `json:"decision"`
 	Source    string    `json:"source"`
 	Reason    string    `json:"reason,omitempty"`
+	Origin    string    `json:"origin,omitempty"`
 }
 
 // NewAuditLog creates a new audit log.

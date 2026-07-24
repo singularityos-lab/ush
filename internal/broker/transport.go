@@ -50,6 +50,19 @@ type rpcRequest struct {
 	SessionID string `json:"session,omitempty"`
 	App       string `json:"app,omitempty"`
 	Enable    bool   `json:"enable,omitempty"`
+	// Origin says where the request started (see origin.go). Absent means the
+	// local control socket, which is what every pre-existing client sends.
+	Origin string `json:"origin,omitempty"`
+	// PIN is carried only by SetBootloaderUnlockArmed when arming. It is passed
+	// to sinty-recoverd for verification and is never logged or stored.
+	PIN string `json:"pin,omitempty"`
+	// Action and Detail carry an SdbElevate call: Action is the kind of privilege
+	// the bridge is asking for (shell-root, write-system, bind-privileged-port)
+	// and Detail is its argument (the target path, the port), empty for a plain
+	// root shell. The path in Detail is already confined by sdbd; the broker only
+	// mediates the privilege on it.
+	Action string `json:"action,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // rpcResponse is the broker's reply.
@@ -60,6 +73,15 @@ type rpcResponse struct {
 	Error       string `json:"error,omitempty"`
 	Policy      string `json:"policy,omitempty"`
 	Enabled     bool   `json:"enabled,omitempty"`
+
+	// OK / Message and the lock fields answer the bootloader methods. OK is
+	// false whenever Error is set, so a client that only reads OK still fails
+	// closed.
+	OK          bool   `json:"ok,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Locked      bool   `json:"locked,omitempty"`
+	UnlockArmed bool   `json:"unlock_armed,omitempty"`
+	UnlockCount int    `json:"unlock_count,omitempty"`
 }
 
 // writeMessage marshals v to JSON and writes it as a single newline-terminated
@@ -111,15 +133,24 @@ func (s *Server) handleConn(conn net.Conn) {
 	if err := readMessage(r, &req); err != nil {
 		return
 	}
-	resp := s.dispatch(req)
+	resp := s.dispatchFrom(req, peerFromConn(conn))
 	_ = writeMessage(conn, resp)
 }
 
-// dispatch routes one RPC request to the matching handler.
+// dispatch routes one RPC request with no peer credentials attached. The
+// operations that need to know who is calling refuse an unknown peer, so this
+// entry point stays usable for everything that does not.
 func (s *Server) dispatch(req rpcRequest) rpcResponse {
+	return s.dispatchFrom(req, peerIdentity{})
+}
+
+// dispatchFrom routes one RPC request from a peer whose credentials the kernel
+// reported (see peer.go).
+func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 	switch req.Method {
 	case "RequestPermission":
-		return rpcResponse{Decision: s.requestPermission(req.Category, req.Resource, req.Reason, req.SessionID)}
+		return rpcResponse{Decision: s.requestPermissionFrom(
+			req.Category, req.Resource, req.Reason, req.SessionID, parseOrigin(req.Origin))}
 	case "RevokePermission":
 		if err := s.revokePermission(req.Category, req.Resource); err != nil {
 			return rpcResponse{Error: err.Error()}
@@ -163,12 +194,32 @@ func (s *Server) dispatch(req rpcRequest) rpcResponse {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{}
+	case "BootloaderLockState":
+		st, err := s.bootloaderLockState()
+		if err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{
+			OK:          true,
+			Locked:      st.Locked,
+			UnlockArmed: st.UnlockArmed,
+			UnlockCount: st.UnlockCount,
+		}
+	case "SetBootloaderUnlockArmed":
+		reply, err := s.setBootloaderUnlockArmed(req.Enable, req.PIN, parseOrigin(req.Origin), peer)
+		if err != nil {
+			return rpcResponse{Error: err.Error(), Message: reply.Message}
+		}
+		return rpcResponse{OK: true, Message: reply.Message}
 	case "ListPermissions":
 		perms, err := s.listPermissions()
 		if err != nil {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{Permissions: perms}
+	case "SdbElevate":
+		granted, reason := s.sdbElevate(req.Action, req.Detail, req.SessionID, parseOrigin(req.Origin))
+		return rpcResponse{OK: granted, Message: reason}
 	default:
 		return rpcResponse{Error: "unknown method: " + req.Method}
 	}

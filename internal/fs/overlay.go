@@ -441,6 +441,7 @@ func (g *GuestFS) setupUsr() error {
 	g.seedUsrSkeleton(pkgUsr)
 	g.seedPerlBase(pkgUsr)
 	g.seedDebconfBase(pkgUsr)
+	g.seedShadowTools(pkgUsr)
 	g.seedBash(pkgUsr)
 
 	// One DEDICATED, non-aliased fuse-overlayfs per top-level /usr subdir: lower=/usr/<X>,
@@ -1034,6 +1035,47 @@ func (g *GuestFS) seedDebconfBase(pkgUsr string) {
 		seed(filepath.Join("bin", b))
 	}
 	ushlog.Info("fs: seeded debconf into pkgroot (confmodule + frontend + Debconf modules for maintainer scripts)")
+}
+
+// seedShadowTools makes the account-management helpers that maintainer scripts
+// expect resolvable in the guest, seeded into the pkgroot upper before the /usr
+// overlay mounts (same reason as seedDebconfBase: a binary installed at runtime
+// can land behind the rootless overlay and stay invisible in-session).
+//
+//   - getent (from libc-bin, staged in the tools tree) -> /usr/bin/getent.
+//     Countless postinsts call `getent passwd|group NAME` to test for existence
+//     before creating a user/group; without it they die "getent: not found".
+//   - shadowconfig -> a no-op stub. It only toggles shadow-password files, which
+//     the guest does not use (it has no daemons and no shadow suite); passwd's
+//     postinst calls it unconditionally, so a stub that exits 0 lets configure
+//     finish instead of aborting on a missing binary. The stub is honest: it
+//     stands in for a system operation that is meaningless in the sandbox, it
+//     does not fake a real shadow conversion.
+func (g *GuestFS) seedShadowTools(pkgUsr string) {
+	if g.ToolsDir == "" {
+		return
+	}
+	toolsUsr := filepath.Join(g.GuestRoot, g.ToolsDir, "usr")
+	if src := filepath.Join(toolsUsr, "bin", "getent"); statExists(src) {
+		if dst := filepath.Join(pkgUsr, "bin", "getent"); !statExists(dst) {
+			copyFileIfExists(src, dst)
+		}
+	} else {
+		ushlog.Debug("fs: getent not staged in tools, maintainer scripts calling it may fail", "toolsUsr", toolsUsr)
+	}
+	// shadowconfig stub: sbin so it is on the maintainer-script PATH.
+	stub := filepath.Join(pkgUsr, "sbin", "shadowconfig")
+	if !statExists(stub) {
+		os.MkdirAll(filepath.Dir(stub), 0o755)                   //nolint:errcheck
+		os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755) //nolint:errcheck
+	}
+	ushlog.Info("fs: seeded shadow tools into pkgroot (/usr/bin/getent + shadowconfig stub)")
+}
+
+// statExists reports whether path exists (any type).
+func statExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }
 
 func copyFileIfExists(src, dst string) {

@@ -390,6 +390,16 @@ func (m *Manager) fixDirectDpkg(ctx context.Context, stdout, stderr io.Writer) e
 	}
 
 	pathValue := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:" + os.Getenv("PATH")
+	// Prepend the RAW pkgroot bin dirs, matching the ush session PATH. A package's
+	// self-shipped helper (e.g. ca-certificates' update-ca-certificates in
+	// /usr/sbin, libpam-runtime's pam-auth-update) is written raw into pkgroot
+	// behind the /usr overlay, so the merged /usr/sbin view does not surface it to
+	// its own postinst in the same session; the raw pkgroot path does. Prepend so
+	// installed binaries win over the base, consistent with the interactive shell.
+	if m.pkgPrefix != "" {
+		pathValue = filepath.Join(m.pkgPrefix, "usr", "sbin") + ":" +
+			filepath.Join(m.pkgPrefix, "usr", "bin") + ":" + pathValue
+	}
 	if hookDir != "" {
 		pathValue = hookDir + ":" + pathValue
 	}
@@ -402,6 +412,11 @@ func (m *Manager) fixDirectDpkg(ctx context.Context, stdout, stderr io.Writer) e
 		// which live in /sbin and /usr/sbin, ensure they are on PATH.
 		"PATH="+pathValue,
 		"USH_PRELOAD_IDENTITY=root",
+		// Maintainer helpers (addgroup/adduser/useradd, shadow tools) gate on a
+		// numeric geteuid()==0 check. The guest already owns the userns and holds
+		// its capabilities regardless of the reported id, so let the shim report
+		// root for this invocation only (scoped to dpkg + its script children).
+		"USH_FAKE_ROOT=1",
 	)
 
 	if shimEnv, err := preloadShimEnv(); err == nil {
@@ -736,6 +751,16 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 	}
 
 	pathValue := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:" + os.Getenv("PATH")
+	// Prepend the RAW pkgroot bin dirs, matching the ush session PATH. A package's
+	// self-shipped helper (e.g. ca-certificates' update-ca-certificates in
+	// /usr/sbin, libpam-runtime's pam-auth-update) is written raw into pkgroot
+	// behind the /usr overlay, so the merged /usr/sbin view does not surface it to
+	// its own postinst in the same session; the raw pkgroot path does. Prepend so
+	// installed binaries win over the base, consistent with the interactive shell.
+	if m.pkgPrefix != "" {
+		pathValue = filepath.Join(m.pkgPrefix, "usr", "sbin") + ":" +
+			filepath.Join(m.pkgPrefix, "usr", "bin") + ":" + pathValue
+	}
 	if hookDir != "" {
 		pathValue = hookDir + ":" + pathValue
 	}
@@ -753,6 +778,12 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// which live in /sbin and /usr/sbin, ensure they are on PATH.
 		"PATH="+pathValue,
 		"USH_PRELOAD_IDENTITY=root",
+		// Report root to the shim's id getters for this invocation only, so
+		// maintainer helpers (addgroup/adduser/useradd, shadow tools) pass their
+		// numeric geteuid()==0 check. The guest already holds the userns caps;
+		// this clears the check without granting real privilege, and never leaks
+		// outside the dpkg/apt window (interactive guest + dsh stay keep-id).
+		"USH_FAKE_ROOT=1",
 	)
 
 	// Inject the LD_PRELOAD shim if it exists. dpkg maintainer scripts
@@ -792,13 +823,29 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		env = append(env, "DPKG_DATADIR="+guestExec+"/share/dpkg")
 		// Prepend the guest exec dir to PATH so dpkg finds its staged helpers
 		// (dpkg-deb, dpkg-split) and the no-op ldconfig stub during configure.
-		env = append(env, "PATH="+guestExec+":"+os.Getenv("PATH"))
+		// Also prepend the RAW pkgroot bin dirs: a package's self-shipped helper
+		// (ca-certificates' update-ca-certificates in /usr/sbin, libpam-runtime's
+		// pam-auth-update) is written raw into pkgroot behind the /usr overlay, so
+		// the mounted /usr/sbin view does not surface it to its own postinst in the
+		// same session; the raw pkgroot path does. This effective PATH is what
+		// reaches the maintainer scripts (it overrides the earlier pathValue).
+		rawPkgBins := ""
+		if m.pkgPrefix != "" {
+			rawPkgBins = filepath.Join(m.pkgPrefix, "usr", "sbin") + ":" +
+				filepath.Join(m.pkgPrefix, "usr", "bin") + ":"
+		}
+		env = append(env, "PATH="+rawPkgBins+guestExec+":"+os.Getenv("PATH"))
 
 		// runApt executes INSIDE the namespace, where toolsDir is not visible (ush
 		// write-isolates it); the real apt/dpkg tools are bind-staged at
 		// /run/ush/exec. Reference those guest paths, or the -o overrides that probe
 		// toolsDir silently drop and apt/dpkg fall back to absent /usr paths.
-		dpkgPath := guestExec + ":/usr/sbin:/usr/bin:/sbin:/bin"
+		// rawPkgBins (raw pkgroot usr/sbin+usr/bin) leads here too: apt sets the
+		// maintainer-script PATH from Dpkg::Path (below), which OVERRIDES the env
+		// PATH, so a package's self-shipped helper (update-ca-certificates,
+		// pam-auth-update), written raw into pkgroot behind the /usr overlay, is
+		// only findable via the raw pkgroot path on this PATH.
+		dpkgPath := rawPkgBins + guestExec + ":/usr/sbin:/usr/bin:/sbin:/bin"
 		if hookDir != "" {
 			dpkgPath = hookDir + ":" + dpkgPath
 		}
@@ -1052,10 +1099,31 @@ func ensurePkgAdminDir(pkgPrefix string) (string, error) {
 			return adminDir, err
 		}
 	}
-	// Create empty status if it doesn't exist (no packages installed in prefix).
+	// Seed the pkgroot status with a synthetic package that Provides usr-is-merged.
+	// The Sinty base is already merged-usr (/bin,/lib,/sbin are symlinks into /usr),
+	// but the pkgroot has its OWN empty dpkg database, so apt does not know that and
+	// tries to satisfy the modern `usr-is-merged` Pre-Depends by installing usrmerge.
+	// usrmerge's preinst then aborts ("/usr is a standalone filesystem, this requires
+	// using an initramfs") because the guest /usr is an overlay/erofs mount, failing
+	// the whole install of any package whose dependency chain pulls usrmerge (man-db,
+	// etc.). Declaring usr-is-merged already provided keeps apt from ever selecting
+	// usrmerge, matching the base's real merged-usr layout.
 	statusFile := filepath.Join(adminDir, "status")
 	if _, err := os.Stat(statusFile); os.IsNotExist(err) {
-		if err := os.WriteFile(statusFile, nil, 0644); err != nil {
+		seed := "Package: sinty-usr-is-merged\n" +
+			"Status: install ok installed\n" +
+			"Priority: required\n" +
+			"Section: oldlibs\n" +
+			"Installed-Size: 1\n" +
+			"Maintainer: Sinty <root@localhost>\n" +
+			"Architecture: all\n" +
+			"Multi-Arch: foreign\n" +
+			"Version: 1\n" +
+			"Provides: usr-is-merged\n" +
+			"Description: Sinty base is merged-usr\n" +
+			" The base /usr is already merged (/bin,/lib,/sbin symlink into /usr), so\n" +
+			" usr-is-merged is satisfied and usrmerge must not be installed in the guest.\n"
+		if err := os.WriteFile(statusFile, []byte(seed), 0644); err != nil {
 			return adminDir, err
 		}
 	}

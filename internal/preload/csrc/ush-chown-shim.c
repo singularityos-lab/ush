@@ -26,15 +26,9 @@ static int is_write_flags(int flags) {
 }
 
 static char *redirect_path(const char *path) {
-    // Path redirection is disabled: dpkg now installs with --instdir=/ so it writes
-    // THROUGH the /usr fuse-overlayfs (the subuid range lets the rootless overlay
-    // copy-up), and the overlay itself carries pkgroot into /usr. The old redirect
-    // rewrote /usr writes into the raw upperdir behind the overlay, which the merged
-    // view never reliably surfaced (new dirs, in-both files), and it only ever
-    // covered writes (never reads or execve), so maintainer scripts still broke.
-    // Redirect and overlay were two half-mechanisms for the same job; the overlay is
-    // the one that also covers the kernel's execve. This shim now does identity
-    // remapping (uid/gid) only.
+    // Path redirection is disabled: dpkg installs with --instdir=/ so writes go
+    // through the /usr fuse-overlayfs, which also covers execve. This shim now
+    // does identity (uid/gid) remapping only.
     (void)path;
     return NULL;
 }
@@ -96,23 +90,50 @@ static int identity_host(void) {
     return mode && strcmp(mode, "host") == 0;
 }
 
+/*
+ * Fake-root gate. When USH_FAKE_ROOT=1, the id getters report uid/gid 0.
+ * ush sets this ONLY in the env of the dpkg/apt invocation (runApt), so it
+ * reaches dpkg and its maintainer-script children but never the interactive
+ * guest or dsh, which keep their real keep-id identity. Maintainer helpers
+ * (addgroup/adduser/useradd, the shadow tools) gate on a NUMERIC geteuid()==0
+ * check; the guest already holds the namespace capabilities (they come from
+ * owning the userns, not from the id number), so clearing the numeric check
+ * grants no privilege the guest lacks -- it only stops the check from rejecting
+ * an install that is otherwise permitted. Kept independent of identity_host
+ * (that gate fakes the HOST uid for Electron sandboxing; opposite direction).
+ */
+static int fake_root(void) {
+    const char *m = getenv("USH_FAKE_ROOT");
+    return m && strcmp(m, "1") == 0;
+}
+
 uid_t getuid(void) {
+    if (fake_root()) return 0;
     return identity_host() ? get_host_uid() : (uid_t)syscall(SYS_getuid);
 }
 
 uid_t geteuid(void) {
+    if (fake_root()) return 0;
     return identity_host() ? get_host_uid() : (uid_t)syscall(SYS_geteuid);
 }
 
 gid_t getgid(void) {
+    if (fake_root()) return 0;
     return identity_host() ? get_host_gid() : (gid_t)syscall(SYS_getgid);
 }
 
 gid_t getegid(void) {
+    if (fake_root()) return 0;
     return identity_host() ? get_host_gid() : (gid_t)syscall(SYS_getegid);
 }
 
 int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
+    if (fake_root()) {
+        if (ruid) *ruid = 0;
+        if (euid) *euid = 0;
+        if (suid) *suid = 0;
+        return 0;
+    }
     if (!identity_host()) return syscall(SYS_getresuid, ruid, euid, suid);
     uid_t h = get_host_uid();
     if (ruid) *ruid = h;
@@ -122,6 +143,12 @@ int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
 }
 
 int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
+    if (fake_root()) {
+        if (rgid) *rgid = 0;
+        if (egid) *egid = 0;
+        if (sgid) *sgid = 0;
+        return 0;
+    }
     if (!identity_host()) return syscall(SYS_getresgid, rgid, egid, sgid);
     gid_t h = get_host_gid();
     if (rgid) *rgid = h;

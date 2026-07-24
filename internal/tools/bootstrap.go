@@ -91,6 +91,12 @@ var requiredPackages = []pkgSpec{
 	// does). Stage it like libtinfo6 for bash; it lands in the guest lib path so
 	// the /usr/bin/perl seeded from perl-base resolves it.
 	{name: "libcrypt1", poolPath: "pool/main/libx/libxcrypt"},
+	// libc-bin ships getent, which countless maintainer scripts call to test
+	// whether a user/group already exists (getent passwd/group) before creating
+	// it. The busybox base has no getent, so those scripts die "getent: not
+	// found". Staging it into the tools tree lets seedShadowTools expose
+	// /usr/bin/getent in the guest. libnss_files (in the base libc) backs it.
+	{name: "libc-bin", poolPath: "pool/main/g/glibc"},
 }
 
 type pkgSpec struct {

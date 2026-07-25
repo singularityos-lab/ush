@@ -24,7 +24,7 @@ It ships two profiles from the same binary:
 ## Architecture
 
 ```
-Host (immutable Debian-based system)
+Host (immutable Linux, base-system agnostic)
   +- ush (no real root)
        +- user namespace   (guest uid maps to the host user)
        +- mount namespace  (overlay: host RO + layer upper)
@@ -38,7 +38,7 @@ Host (immutable Debian-based system)
        +- /proc  -> isolated proc namespace
        +- /run   -> per-session tmpfs
             |
-            +- systemd --user (guest)
+            +- systemd --user (guest, where the host provides it)
                  +- ush shell (pkg, broker client, job control)
 ```
 
@@ -52,7 +52,10 @@ ush -v               # verbose (info-level logs)
 dsh                  # developer profile (podman/distrobox capable)
 ```
 
-### Package runtime
+The `pkg` runtime resolves and downloads packages from Debian repositories with
+`apt`, then stages them into a layer over the read-only host. That apt
+configuration is the only Debian dependency: nothing about the host itself needs
+to be Debian, and the base system underneath can be any immutable Linux.
 
 ```bash
 pkg install htop            # install into the persistent layer

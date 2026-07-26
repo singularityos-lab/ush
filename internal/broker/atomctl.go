@@ -21,11 +21,11 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"time"
 )
 
 const defaultAtomControlSocket = "/run/atom/control.sock"
+const defaultAtomSDBControlSocket = "/run/atom/sdb-control.sock"
 
 const (
 	atomDialTimeout = 3 * time.Second
@@ -40,52 +40,14 @@ func atomControlSocketPath() string {
 	return defaultAtomControlSocket
 }
 
-// defaultSdbOptIn is the per-bridge marker sdbd and its unit both require. It is
-// deliberately NOT the development marker: that one governs the whole image and
-// lives on the read-only verity tree, while this one governs the bridge alone
-// and lives on writable storage. Absent means off, so a fresh image carries no
-// listener until the owner asks for one.
-const defaultSdbOptIn = "/var/lib/sinty-sdb/enabled"
-
-func sdbOptInPath() string {
-	if p := os.Getenv("USH_SDB_OPT_IN"); p != "" {
+func atomSDBControlSocketPath() string {
+	if p := os.Getenv("USH_ATOM_SDB_CONTROL_SOCK"); p != "" {
 		return p
 	}
-	return defaultSdbOptIn
-}
-
-// setSdbOptIn creates or removes the marker. Removal treats an already-absent
-// marker as done, so turning off a bridge that is already off is not an error.
-func setSdbOptIn(on bool) error {
-	path := sdbOptInPath()
-	if !on {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("sdb opt-in: remove %s: %w", path, err)
-		}
-		return nil
+	if p := os.Getenv("USH_ATOM_CONTROL_SOCK"); p != "" {
+		return p
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("sdb opt-in: create dir: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("sdb opt-in: create %s: %w", path, err)
-	}
-	return f.Close()
-}
-
-// sdbUnitName is the unit the debug bridge runs as. It is overridable because
-// the unit is shipped by the image rather than by this repository; if the name
-// is wrong, Present reports false and the desktop greys the control out, which
-// is the safe direction.
-func sdbUnitName() string {
-	if n := os.Getenv("USH_SDB_UNIT"); n != "" {
-		return n
-	}
-	// The image ships the bridge as sdbd.service (package sinty-sdb installs
-	// dist/sdbd.service). sinit reports and keys units by their full file name,
-	// so the broker must match that exactly, including the .service suffix.
-	return "sdbd.service"
+	return defaultAtomSDBControlSocket
 }
 
 type atomRequest struct {
@@ -141,10 +103,10 @@ func atomReadFrame(r io.Reader, v any) error {
 
 // atomControlCall sends one request to PID 1 and returns the reply. Every
 // failure is an error; a reply that merely arrived is not a success.
-func atomControlCall(req atomRequest) (atomReply, error) {
-	conn, err := net.DialTimeout("unix", atomControlSocketPath(), atomDialTimeout)
+func atomControlCallAt(path string, req atomRequest) (atomReply, error) {
+	conn, err := net.DialTimeout("unix", path, atomDialTimeout)
 	if err != nil {
-		return atomReply{}, fmt.Errorf("init control unreachable: %w", err)
+		return atomReply{}, fmt.Errorf("init control unreachable at %s: %w", path, err)
 	}
 	defer conn.Close()
 
@@ -159,55 +121,38 @@ func atomControlCall(req atomRequest) (atomReply, error) {
 	return rep, nil
 }
 
+func atomControlCall(req atomRequest) (atomReply, error) {
+	return atomControlCallAt(atomControlSocketPath(), req)
+}
+
+func atomSDBControlCall(req atomRequest) (atomReply, error) {
+	return atomControlCallAt(atomSDBControlSocketPath(), req)
+}
+
 // atomSdbService controls the debug bridge unit through the init.
 type atomSdbService struct{}
 
-// Present reports whether the unit is known to the init. list-units needs no
-// privilege, so this answers even where a mutation would be refused.
+// Present reports whether the unit file is known to the init. status also sees
+// units outside the boot graph without starting them.
 func (atomSdbService) Present() (bool, error) {
-	rep, err := atomControlCall(atomRequest{Cmd: "list-units"})
+	rep, err := atomSDBControlCall(atomRequest{Cmd: "sdb-status"})
 	if err != nil {
 		return false, err
 	}
 	if !rep.OK {
-		return false, fmt.Errorf("init control: list-units: %s", atomError(rep))
+		return false, fmt.Errorf("init control: status: %s", atomError(rep))
 	}
-	want := sdbUnitName()
-	for _, u := range rep.Units {
-		if u.Name == want {
-			return true, nil
-		}
-	}
-	return false, nil
+	return rep.State != "unknown" && rep.State != "not-found", nil
 }
 
-// SetEnabled switches the bridge in both halves: the persistent marker, then the
-// live state. It deliberately does not attempt to change unit enablement, which
-// does not exist as a live operation here (see the file comment).
-//
-// The marker always moves FIRST, in both directions, and the init command is
-// issued only if that succeeded. The ordering is the safety property: a crash
-// between the two steps must leave the closed state, never the open one.
-//
-//   - disabling removes the marker before the stop, so an interrupted disable
-//     leaves a bridge that is not allowed to come back at next boot
-//   - enabling creates it before the start, so an interrupted enable leaves a
-//     bridge that is allowed but not running, which the next status read reports
-//     honestly as inactive
-//
-// A marker that cannot be written is a hard failure and no init command is sent:
-// changing the live state while the persistent state stayed behind is exactly
-// the disagreement this ordering exists to prevent.
+// SetEnabled asks PID 1 to update both the persistent gate and live state. The
+// dedicated socket accepts no arbitrary unit name or general init operation.
 func (atomSdbService) SetEnabled(on bool) error {
-	if err := setSdbOptIn(on); err != nil {
-		return err
-	}
-
-	cmd := "stop"
+	cmd := "sdb-disable"
 	if on {
-		cmd = "start"
+		cmd = "sdb-enable"
 	}
-	rep, err := atomControlCall(atomRequest{Cmd: cmd, Unit: sdbUnitName()})
+	rep, err := atomSDBControlCall(atomRequest{Cmd: cmd})
 	if err != nil {
 		return err
 	}

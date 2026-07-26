@@ -26,6 +26,10 @@ func main() {
 }
 
 func run() error {
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, 4, 0, 0, 0, 0, 0); errno != 0 {
+		return fmt.Errorf("disable process dumpability: %w", errno)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("config: %w", err)

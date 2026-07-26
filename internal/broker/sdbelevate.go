@@ -3,7 +3,7 @@
 
 // sdbelevate.go mediates the privileged actions of SDB phase 2. The debug bridge
 // daemon (sdbd) has no privileges of its own: when a paired host asks for a root
-// shell, a write outside the bridge user's home, or a privileged port, sdbd does
+// shell, a write outside the transfer root, or a privileged port, sdbd does
 // NOT act on it directly. It relays the request here, as an ordinary broker
 // client, and the broker asks the person at the device for a per-action
 // approval, exactly as it does for any other remote request.

@@ -20,8 +20,8 @@ type fakeInit struct {
 	units []atomUnitStatus
 	// fail makes every mutation reply with OK=false and this error.
 	fail string
-	// listFails makes list-units reply OK=false.
-	listFails bool
+	// managerFails makes status and list-units reply OK=false.
+	managerFails bool
 	// garbage makes the server answer with a frame that is not a valid reply.
 	garbage bool
 	// hangup makes the server close without answering.
@@ -65,7 +65,7 @@ func startFakeInit(t *testing.T, f *fakeInit) {
 				f.mu.Lock()
 				f.calls = append(f.calls, req)
 				observe := f.observe
-				fail, listFails := f.fail, f.listFails
+				fail, managerFails := f.fail, f.managerFails
 				garbage, hangup := f.garbage, f.hangup
 				units := f.units
 				f.mu.Unlock()
@@ -82,13 +82,30 @@ func startFakeInit(t *testing.T, f *fakeInit) {
 					return
 				}
 				switch req.Cmd {
+				case "status", "sdb-status":
+					if managerFails {
+						atomWriteFrame(c, atomReply{Error: "manager unavailable"})
+						return
+					}
+					state := "unknown"
+					unitName := req.Unit
+					if req.Cmd == "sdb-status" {
+						unitName = "sdbd.service"
+					}
+					for _, unit := range units {
+						if unit.Name == unitName {
+							state = unit.State
+							break
+						}
+					}
+					atomWriteFrame(c, atomReply{OK: true, State: state})
 				case "list-units":
-					if listFails {
+					if managerFails {
 						atomWriteFrame(c, atomReply{Error: "manager unavailable"})
 						return
 					}
 					atomWriteFrame(c, atomReply{OK: true, Units: units})
-				case "start", "stop":
+				case "start", "stop", "sdb-enable", "sdb-disable":
 					if fail != "" {
 						atomWriteFrame(c, atomReply{Error: fail})
 						return
@@ -107,16 +124,17 @@ func startFakeInit(t *testing.T, f *fakeInit) {
 	})
 
 	t.Setenv("USH_ATOM_CONTROL_SOCK", sock)
+	t.Setenv("USH_ATOM_SDB_CONTROL_SOCK", sock)
 }
 
-// Present is true only when the init actually lists the unit.
+// Present is true only when the init knows the unit file.
 func TestAtomServicePresent(t *testing.T) {
 	cases := []struct {
-		name      string
-		units     []atomUnitStatus
-		listFails bool
-		want      bool
-		wantErr   bool
+		name         string
+		units        []atomUnitStatus
+		managerFails bool
+		want         bool
+		wantErr      bool
 	}{
 		{
 			name:  "unit listed",
@@ -129,11 +147,11 @@ func TestAtomServicePresent(t *testing.T) {
 			want:  false,
 		},
 		{name: "no units at all", want: false},
-		{name: "list refused", listFails: true, wantErr: true},
+		{name: "status refused", managerFails: true, wantErr: true},
 	}
 
 	for _, c := range cases {
-		f := &fakeInit{units: c.units, listFails: c.listFails}
+		f := &fakeInit{units: c.units, managerFails: c.managerFails}
 		startFakeInit(t, f)
 
 		got, err := (atomSdbService{}).Present()
@@ -156,7 +174,6 @@ func TestAtomServicePresent(t *testing.T) {
 // under this init they do not exist as live operations and the image is read
 // only, so a request for them could only ever be a lie.
 func TestAtomServiceIssuesOnlyStartAndStop(t *testing.T) {
-	markerFixture(t)
 	f := &fakeInit{}
 	startFakeInit(t, f)
 
@@ -171,16 +188,11 @@ func TestAtomServiceIssuesOnlyStartAndStop(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("requests = %d, want 2", len(got))
 	}
-	if got[0].Cmd != "start" || got[0].Unit != "sdbd.service" {
-		t.Errorf("first request = %+v, want start of sinty-sdb", got[0])
+	if got[0].Cmd != "sdb-enable" || got[0].Unit != "" {
+		t.Errorf("first request = %+v, want sdb-enable", got[0])
 	}
-	if got[1].Cmd != "stop" || got[1].Unit != "sdbd.service" {
-		t.Errorf("second request = %+v, want stop of sinty-sdb", got[1])
-	}
-	for _, r := range got {
-		if r.Cmd == "enable" || r.Cmd == "disable" {
-			t.Errorf("broker issued %q, which does not exist on this init", r.Cmd)
-		}
+	if got[1].Cmd != "sdb-disable" || got[1].Unit != "" {
+		t.Errorf("second request = %+v, want sdb-disable", got[1])
 	}
 }
 
@@ -193,9 +205,8 @@ func TestAtomServiceFailsClosed(t *testing.T) {
 		fail        string
 		garbage     bool
 		hangup      bool
-		// breaksPresent is false for a transport that answers list-units fine and
-		// only refuses the mutation: Present is then legitimately (false, nil),
-		// meaning "unit not listed", which is not an error.
+		// breaksPresent is false for a transport that answers status and only
+		// refuses mutation. Present is then legitimately (false, nil).
 		breaksPresent bool
 	}{
 		{name: "socket unreachable", unreachable: true, breaksPresent: true},
@@ -206,10 +217,10 @@ func TestAtomServiceFailsClosed(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		markerFixture(t)
 		f := &fakeInit{fail: c.fail, garbage: c.garbage, hangup: c.hangup}
 		if c.unreachable {
 			t.Setenv("USH_ATOM_CONTROL_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
+			t.Setenv("USH_ATOM_SDB_CONTROL_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
 		} else {
 			startFakeInit(t, f)
 		}
@@ -230,30 +241,9 @@ func TestAtomServiceFailsClosed(t *testing.T) {
 	}
 }
 
-// The unit name is configurable because the image ships the unit, not this repo.
-func TestAtomServiceHonoursUnitOverride(t *testing.T) {
-	markerFixture(t)
-	f := &fakeInit{units: []atomUnitStatus{{Name: "custom-bridge"}}}
-	startFakeInit(t, f)
-	t.Setenv("USH_SDB_UNIT", "custom-bridge")
-
-	present, err := (atomSdbService{}).Present()
-	if err != nil || !present {
-		t.Fatalf("Present = %v, %v, want true, nil", present, err)
-	}
-	if err := (atomSdbService{}).SetEnabled(true); err != nil {
-		t.Fatalf("SetEnabled: %v", err)
-	}
-	got := f.requests()
-	if got[len(got)-1].Unit != "custom-bridge" {
-		t.Errorf("unit = %q, want custom-bridge", got[len(got)-1].Unit)
-	}
-}
-
 // End to end over the real framing: the broker's status and switch paths on top
 // of a fake init, with the observation still coming from the socket probe.
 func TestSdbOverInitControl(t *testing.T) {
-	markerFixture(t)
 	f := &fakeInit{units: []atomUnitStatus{{Name: "sdbd.service", State: "stopped"}}}
 	startFakeInit(t, f)
 
@@ -285,203 +275,5 @@ func TestSdbOverInitControl(t *testing.T) {
 	ok, active, msg = srv.setSdbEnabled(true, Origin{}, localPeer())
 	if !ok || !active || msg != msgSdbOn {
 		t.Errorf("switch = (%v, %v, %q), want (true, true, %q)", ok, active, msg, msgSdbOn)
-	}
-}
-
-// markerFixture points the opt-in marker at a temp path and returns it.
-func markerFixture(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sinty-sdb", "enabled")
-	t.Setenv("USH_SDB_OPT_IN", path)
-	return path
-}
-
-func markerExists(t *testing.T, path string) bool {
-	t.Helper()
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// The marker is created on enable and removed on disable, and it is the marker
-// that carries the choice across a reboot.
-func TestOptInMarkerFollowsTheSwitch(t *testing.T) {
-	marker := markerFixture(t)
-	f := &fakeInit{}
-	startFakeInit(t, f)
-
-	if markerExists(t, marker) {
-		t.Fatal("marker present before anything was enabled")
-	}
-	if err := (atomSdbService{}).SetEnabled(true); err != nil {
-		t.Fatalf("enable: %v", err)
-	}
-	if !markerExists(t, marker) {
-		t.Error("marker absent after enable")
-	}
-	if err := (atomSdbService{}).SetEnabled(false); err != nil {
-		t.Fatalf("disable: %v", err)
-	}
-	if markerExists(t, marker) {
-		t.Error("marker still present after disable")
-	}
-
-	// Turning off an already-off bridge is not an error.
-	if err := (atomSdbService{}).SetEnabled(false); err != nil {
-		t.Errorf("second disable: %v", err)
-	}
-}
-
-// The ordering is the safety property: the marker must move BEFORE the init
-// command, in both directions, so an interruption leaves the closed state.
-func TestOptInMarkerMovesBeforeTheInitCommand(t *testing.T) {
-	marker := markerFixture(t)
-
-	cases := []struct {
-		name       string
-		enable     bool
-		wantCmd    string
-		wantMarker bool
-	}{
-		{name: "enable creates before start", enable: true, wantCmd: "start", wantMarker: true},
-		{name: "disable removes before stop", enable: false, wantCmd: "stop", wantMarker: false},
-	}
-
-	for _, c := range cases {
-		// Observe the marker state at the moment the init command arrives.
-		var seen bool
-		f := &fakeInit{observe: func(req atomRequest) {
-			if req.Cmd == c.wantCmd {
-				seen = markerExists(t, marker)
-			}
-		}}
-		startFakeInit(t, f)
-
-		if c.enable {
-			os.Remove(marker)
-		} else {
-			os.MkdirAll(filepath.Dir(marker), 0o755)
-			os.WriteFile(marker, nil, 0o644)
-		}
-
-		if err := (atomSdbService{}).SetEnabled(c.enable); err != nil {
-			t.Fatalf("%s: %v", c.name, err)
-		}
-		if seen != c.wantMarker {
-			t.Errorf("%s: marker was %v when %s reached the init, want %v",
-				c.name, seen, c.wantCmd, c.wantMarker)
-		}
-	}
-}
-
-// Negative proof: a marker that cannot be written is a hard failure, and no init
-// command is sent. Changing the live state while the persistent state stayed
-// behind is the disagreement the ordering exists to prevent.
-func TestOptInMarkerFailureBlocksTheInitCommand(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("running as root, an unwritable directory cannot be simulated")
-	}
-
-	dir := t.TempDir()
-	locked := filepath.Join(dir, "locked")
-	if err := os.Mkdir(locked, 0o500); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
-	t.Setenv("USH_SDB_OPT_IN", filepath.Join(locked, "enabled"))
-
-	f := &fakeInit{}
-	startFakeInit(t, f)
-
-	if err := (atomSdbService{}).SetEnabled(true); err == nil {
-		t.Error("enable succeeded with an unwritable marker directory")
-	}
-	if got := f.requests(); len(got) != 0 {
-		t.Errorf("init received %d commands, want 0: the live state must not move when the marker cannot", len(got))
-	}
-}
-
-// The broker-level view of the same failure: ok=false, never an optimistic
-// success, and the observed state is reported rather than the requested one.
-func TestSdbEnableFailsClosedWhenMarkerUnwritable(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("running as root, an unwritable directory cannot be simulated")
-	}
-
-	f := &fakeInit{units: []atomUnitStatus{{Name: "sdbd.service"}}}
-	startFakeInit(t, f)
-
-	srv, _, _ := newSdbFixture(t, false)
-	sdbControl = atomSdbService{}
-
-	dir := t.TempDir()
-	locked := filepath.Join(dir, "locked")
-	if err := os.Mkdir(locked, 0o500); err != nil {
-		t.Fatalf("Mkdir: %v", err)
-	}
-	t.Setenv("USH_SDB_OPT_IN", filepath.Join(locked, "enabled"))
-
-	ok, active, msg := srv.setSdbEnabled(true, Origin{}, localPeer())
-	if ok {
-		t.Error("ok = true although the marker could not be written")
-	}
-	if active {
-		t.Error("active = true although nothing started")
-	}
-	if msg != msgSdbStartFailed {
-		t.Errorf("message = %q, want %q", msg, msgSdbStartFailed)
-	}
-}
-
-// Negative proof: an enable whose start does not take still leaves the marker
-// present (the owner did ask for the bridge), but reports active=false.
-func TestEnableWithFailedStartKeepsMarkerAndReportsInactive(t *testing.T) {
-	marker := markerFixture(t)
-	f := &fakeInit{units: []atomUnitStatus{{Name: "sdbd.service"}}}
-	startFakeInit(t, f)
-
-	srv, _, _ := newSdbFixture(t, false)
-	sdbControl = atomSdbService{}
-
-	ok, active, msg := srv.setSdbEnabled(true, Origin{}, localPeer())
-	if ok {
-		t.Error("ok = true although nothing is listening")
-	}
-	if active {
-		t.Error("active = true although nothing is listening")
-	}
-	if msg != msgSdbStartFailed {
-		t.Errorf("message = %q, want %q", msg, msgSdbStartFailed)
-	}
-	if !markerExists(t, marker) {
-		t.Error("marker absent after an enable whose start failed")
-	}
-}
-
-// Negative proof: a disable whose stop fails still removes the marker, so the
-// bridge cannot come back at next boot, and reports ok=false with active=true so
-// the desktop keeps the switch on for a listener that is still accepting.
-func TestDisableWithFailedStopStillRemovesMarker(t *testing.T) {
-	marker := markerFixture(t)
-	os.MkdirAll(filepath.Dir(marker), 0o755)
-	os.WriteFile(marker, nil, 0o644)
-
-	f := &fakeInit{units: []atomUnitStatus{{Name: "sdbd.service"}}, fail: "permission denied"}
-	startFakeInit(t, f)
-
-	srv, _, _ := newSdbFixture(t, true)
-	sdbControl = atomSdbService{}
-
-	ok, active, msg := srv.setSdbEnabled(false, Origin{}, localPeer())
-	if ok {
-		t.Error("ok = true although the stop failed")
-	}
-	if !active {
-		t.Error("active = false although the listener is still accepting connections")
-	}
-	if msg != msgSdbStopFailed {
-		t.Errorf("message = %q, want %q", msg, msgSdbStopFailed)
-	}
-	if markerExists(t, marker) {
-		t.Error("marker still present after a disable: the bridge would return at next boot")
 	}
 }

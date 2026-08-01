@@ -29,11 +29,6 @@ import (
 // the ground truth for whether the bridge is serving.
 const defaultSdbControlSocket = "/run/sinty-sdb.sock"
 
-// defaultDevGate is the development marker sdbd itself requires. sdbd refuses to
-// start and never binds when it is absent; the broker checks it too so the
-// desktop can grey the control out rather than offer a switch that cannot work.
-const defaultDevGate = "/etc/atom/dev.enabled"
-
 // sdbProbeTimeout bounds one reachability probe.
 const sdbProbeTimeout = 2 * time.Second
 
@@ -47,7 +42,6 @@ var (
 
 // User-facing messages, displayed verbatim by the desktop.
 const (
-	msgSdbDevLocked     = "Developer mode is not unlocked on this device."
 	msgSdbNotInstalled  = "The debug bridge is not installed on this image."
 	msgSdbStateUnknown  = "The state of the debug bridge could not be determined."
 	msgSdbRemoteRefused = "The debug bridge cannot be switched on or off from a remote host."
@@ -63,20 +57,6 @@ func sdbControlSocketPath() string {
 		return p
 	}
 	return defaultSdbControlSocket
-}
-
-func devGatePath() string {
-	if p := os.Getenv("USH_DEV_GATE"); p != "" {
-		return p
-	}
-	return defaultDevGate
-}
-
-// devUnlocked reports whether the development marker is present. An unreadable
-// marker is not an unlocked one.
-func devUnlocked() bool {
-	_, err := os.Stat(devGatePath())
-	return err == nil
 }
 
 // sdbService is the seam through which the broker actuates the sdbd service.
@@ -157,9 +137,6 @@ func (s *Server) sdbStatus() (available bool, active bool, message string) {
 	if !present {
 		return false, activeOrUnknown(active, known), msgSdbNotInstalled
 	}
-	if !devUnlocked() {
-		return false, activeOrUnknown(active, known), msgSdbDevLocked
-	}
 	if !known {
 		return false, false, msgSdbStateUnknown
 	}
@@ -205,14 +182,6 @@ func (s *Server) setSdbEnabled(enabled bool, origin Origin, peer peerIdentity) (
 		s.auditSdb(enabled, "deny", "service_absent", origin)
 		return false, pessimisticActive(enabled), msgSdbNotInstalled
 	}
-	// The development gate blocks turning the bridge ON only. Turning it off must
-	// never be blocked: a device whose gate was removed while the bridge is up
-	// still needs the switch that closes it.
-	if enabled && !devUnlocked() {
-		s.auditSdb(enabled, "deny", "dev_locked", origin)
-		return false, pessimisticActive(enabled), msgSdbDevLocked
-	}
-
 	switchErr := sdbControl.SetEnabled(enabled)
 	if switchErr != nil {
 		ushlog.Warn("broker: sdb switch failed", "enable", enabled, "err", switchErr)

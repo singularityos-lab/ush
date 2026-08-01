@@ -3,13 +3,11 @@
 package broker
 
 import (
-	"bufio"
 	"encoding/json"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +21,7 @@ type mockAgent struct {
 	mu    sync.Mutex
 	calls []string
 	armed []bool
+	pins  []string
 
 	status   int
 	body     string
@@ -48,6 +47,15 @@ func (m *mockAgent) lastArmed() (bool, bool) {
 		return false, false
 	}
 	return m.armed[len(m.armed)-1], true
+}
+
+func (m *mockAgent) lastPIN() (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pins) == 0 {
+		return "", false
+	}
+	return m.pins[len(m.pins)-1], true
 }
 
 // startMockAgent serves the mock on a unix socket and points the broker at it.
@@ -82,12 +90,11 @@ func startMockAgent(t *testing.T, m *mockAgent) {
 	})
 	mux.HandleFunc("/arm-unlock", func(w http.ResponseWriter, r *http.Request) {
 		m.record("/arm-unlock")
-		var req struct {
-			Armed bool `json:"armed"`
-		}
+		var req armRequest
 		json.NewDecoder(r.Body).Decode(&req)
 		m.mu.Lock()
 		m.armed = append(m.armed, req.Armed)
+		m.pins = append(m.pins, req.PIN)
 		m.mu.Unlock()
 
 		if m.status != 0 && m.status != http.StatusOK {
@@ -112,92 +119,8 @@ func startMockAgent(t *testing.T, m *mockAgent) {
 	t.Setenv("USH_ATOM_RECOVERY_SOCK", sock)
 }
 
-// testPIN is the PIN the mock recoverd accepts. It is a test fixture, not a
-// credential of any kind.
+// testPIN is a test fixture, not a credential of any kind.
 const testPIN = "1234"
-
-// mockRecoverd stands in for sinty-recoverd's verify action, speaking the same
-// newline delimited protocol: verify, uid, pin.
-type mockRecoverd struct {
-	mu      sync.Mutex
-	seen    int
-	lines   [][]string
-	reply   string
-	literal bool
-}
-
-func (m *mockRecoverd) attempts() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.seen
-}
-
-func (m *mockRecoverd) lastRequest() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.lines) == 0 {
-		return nil
-	}
-	return m.lines[len(m.lines)-1]
-}
-
-func startMockRecoverd(t *testing.T, m *mockRecoverd) {
-	t.Helper()
-
-	dir, err := os.MkdirTemp("", "ush-recoverd")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	sock := filepath.Join(dir, "r.sock")
-
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen %s: %v", sock, err)
-	}
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				r := bufio.NewReader(c)
-				var got []string
-				for i := 0; i < 3; i++ {
-					line, err := r.ReadString('\n')
-					if err != nil && line == "" {
-						return
-					}
-					got = append(got, strings.TrimRight(line, "\r\n"))
-				}
-				m.mu.Lock()
-				m.seen++
-				m.lines = append(m.lines, got)
-				literal, reply := m.literal, m.reply
-				m.mu.Unlock()
-
-				if literal {
-					c.Write([]byte(reply + "\n"))
-					return
-				}
-				if len(got) == 3 && got[0] == "verify" && got[2] == testPIN {
-					c.Write([]byte("OK\n"))
-					return
-				}
-				c.Write([]byte("FAIL\n"))
-			}(conn)
-		}
-	}()
-
-	t.Cleanup(func() {
-		ln.Close()
-		os.RemoveAll(dir)
-	})
-
-	t.Setenv("USH_RECOVERD_SOCK", sock)
-}
 
 // localPeer is the credentials the kernel reports for a same-user connection.
 func localPeer() peerIdentity {
@@ -233,8 +156,6 @@ func TestArmUnlockRefusedFromRemoteOrigin(t *testing.T) {
 	for _, c := range cases {
 		agent := &mockAgent{}
 		startMockAgent(t, agent)
-		rec := &mockRecoverd{}
-		startMockRecoverd(t, rec)
 		srv := newBootloaderServer(t)
 
 		_, err := srv.setBootloaderUnlockArmed(true, testPIN, parseOrigin(c.origin), localPeer())
@@ -244,10 +165,6 @@ func TestArmUnlockRefusedFromRemoteOrigin(t *testing.T) {
 		if agent.callCount() != 0 {
 			t.Errorf("%s: recovery agent was contacted %d times, want 0", c.name, agent.callCount())
 		}
-		if rec.attempts() != 0 {
-			t.Errorf("%s: recoverd was contacted %d times, want 0: a remote arm must be refused before the PIN is even considered",
-				c.name, rec.attempts())
-		}
 	}
 }
 
@@ -255,7 +172,6 @@ func TestArmUnlockRefusedFromRemoteOrigin(t *testing.T) {
 func TestArmUnlockLocalWithCorrectPIN(t *testing.T) {
 	agent := &mockAgent{}
 	startMockAgent(t, agent)
-	startMockRecoverd(t, &mockRecoverd{})
 	srv := newBootloaderServer(t)
 
 	reply, err := srv.setBootloaderUnlockArmed(true, testPIN, Origin{}, localPeer())
@@ -272,30 +188,30 @@ func TestArmUnlockLocalWithCorrectPIN(t *testing.T) {
 	if !ok || !armed {
 		t.Errorf("agent received armed = %v (present %v), want true", armed, ok)
 	}
+	if pin, ok := agent.lastPIN(); !ok || pin != testPIN {
+		t.Errorf("agent received PIN = %q (present %v), want the supplied PIN", pin, ok)
+	}
 }
 
-// Negative proof: every PIN that is not the right one refuses, and the
-// privileged agent is never contacted. A wrong PIN that still reached the agent
-// would mean the gate is decorative.
+// Malformed PINs are refused before the privileged agent is contacted. A
+// well-formed wrong PIN reaches the agent, which owns the authoritative check.
 func TestArmUnlockRefusedForBadPIN(t *testing.T) {
 	cases := []struct {
-		name    string
-		pin     string
-		wantMsg string
-		// verified is true when the attempt should reach recoverd at all.
-		verified bool
+		name      string
+		pin       string
+		wantMsg   string
+		agentBody string
+		wantCalls int
 	}{
-		{name: "wrong pin", pin: "9999", wantMsg: msgPINWrong, verified: true},
+		{name: "wrong pin", pin: "9999", wantMsg: "Incorrect PIN. Bootloader unlock was not allowed.", agentBody: `{"ok":false,"message":"Incorrect PIN. Bootloader unlock was not allowed."}`, wantCalls: 1},
 		{name: "empty pin", pin: "", wantMsg: msgPINRequired},
 		{name: "newline injection", pin: "1234\nverify\n0\n1234", wantMsg: msgPINRequired},
 		{name: "carriage return injection", pin: "1234\r\n", wantMsg: msgPINRequired},
 	}
 
 	for _, c := range cases {
-		agent := &mockAgent{}
+		agent := &mockAgent{body: c.agentBody}
 		startMockAgent(t, agent)
-		rec := &mockRecoverd{}
-		startMockRecoverd(t, rec)
 		srv := newBootloaderServer(t)
 
 		reply, err := srv.setBootloaderUnlockArmed(true, c.pin, Origin{}, localPeer())
@@ -308,18 +224,13 @@ func TestArmUnlockRefusedForBadPIN(t *testing.T) {
 		if reply.Message != c.wantMsg {
 			t.Errorf("%s: message = %q, want %q", c.name, reply.Message, c.wantMsg)
 		}
-		if agent.callCount() != 0 {
-			t.Errorf("%s: recovery agent contacted %d times, want 0", c.name, agent.callCount())
-		}
-		if !c.verified && rec.attempts() != 0 {
-			t.Errorf("%s: recoverd contacted %d times, want 0 (malformed PIN must not burn an attempt)",
-				c.name, rec.attempts())
+		if agent.callCount() != c.wantCalls {
+			t.Errorf("%s: recovery agent contacted %d times, want %d", c.name, agent.callCount(), c.wantCalls)
 		}
 	}
 }
 
-// A malformed PIN must never be put on recoverd's newline delimited wire: the
-// broker rejects it rather than letting it forge extra protocol lines.
+// A malformed PIN must never be relayed to the root agent.
 func TestPINWellFormed(t *testing.T) {
 	cases := []struct {
 		pin  string
@@ -339,54 +250,11 @@ func TestPINWellFormed(t *testing.T) {
 	}
 }
 
-// If recoverd cannot answer, arming fails closed: no agent call, no arming.
-func TestArmUnlockFailsClosedWhenRecoverdUnreachable(t *testing.T) {
-	agent := &mockAgent{}
-	startMockAgent(t, agent)
-	t.Setenv("USH_RECOVERD_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
-	srv := newBootloaderServer(t)
-
-	reply, err := srv.setBootloaderUnlockArmed(true, testPIN, Origin{}, localPeer())
-	if err == nil {
-		t.Error("arm succeeded with recoverd unreachable, want failure")
-	}
-	if reply.OK {
-		t.Error("reply.OK = true with recoverd unreachable")
-	}
-	if reply.Message != msgPINUnavailable {
-		t.Errorf("message = %q, want %q", reply.Message, msgPINUnavailable)
-	}
-	if agent.callCount() != 0 {
-		t.Errorf("recovery agent contacted %d times, want 0", agent.callCount())
-	}
-}
-
-// A recoverd that answers something other than OK is not an approval.
-func TestArmUnlockRefusedOnUnexpectedRecoverdAnswer(t *testing.T) {
-	answers := []string{"", "NO", "ERR rate limited", "ok", "OK EXTRA", "garbage"}
-
-	for _, answer := range answers {
-		agent := &mockAgent{}
-		startMockAgent(t, agent)
-		startMockRecoverd(t, &mockRecoverd{reply: answer, literal: true})
-		srv := newBootloaderServer(t)
-
-		if _, err := srv.setBootloaderUnlockArmed(true, testPIN, Origin{}, localPeer()); err == nil {
-			t.Errorf("answer %q: arm succeeded, want refusal", answer)
-		}
-		if agent.callCount() != 0 {
-			t.Errorf("answer %q: agent contacted %d times, want 0", answer, agent.callCount())
-		}
-	}
-}
-
 // Disarming must never be blocked by the PIN gate: an owner who cannot produce a
 // PIN must still be able to take consent away.
 func TestDisarmNeedsNoPIN(t *testing.T) {
 	agent := &mockAgent{}
 	startMockAgent(t, agent)
-	// No recoverd at all: disarming must not depend on it.
-	t.Setenv("USH_RECOVERD_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
 	srv := newBootloaderServer(t)
 
 	reply, err := srv.setBootloaderUnlockArmed(false, "", Origin{}, localPeer())
@@ -399,6 +267,9 @@ func TestDisarmNeedsNoPIN(t *testing.T) {
 	armed, ok := agent.lastArmed()
 	if !ok || armed {
 		t.Errorf("agent received armed = %v (present %v), want false", armed, ok)
+	}
+	if pin, ok := agent.lastPIN(); !ok || pin != "" {
+		t.Errorf("agent received PIN = %q (present %v), want empty", pin, ok)
 	}
 }
 
@@ -419,7 +290,6 @@ func TestArmUnlockRefusedForUnverifiedPeer(t *testing.T) {
 	for _, c := range cases {
 		agent := &mockAgent{}
 		startMockAgent(t, agent)
-		startMockRecoverd(t, &mockRecoverd{})
 		srv := newBootloaderServer(t)
 
 		if _, err := srv.setBootloaderUnlockArmed(true, testPIN, Origin{}, c.peer); err == nil {
@@ -488,7 +358,6 @@ func TestAgentFailuresFailClosed(t *testing.T) {
 		t.Setenv("USH_BROKER_CONFIRM", "yes")
 
 		agent := &mockAgent{status: c.status, body: c.body}
-		startMockRecoverd(t, &mockRecoverd{})
 		if c.unreachable {
 			// Point the broker at a path where nothing listens.
 			t.Setenv("USH_ATOM_RECOVERY_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
@@ -578,9 +447,9 @@ func TestExistingDispatchUnchanged(t *testing.T) {
 func TestDBusArmBootloaderUnlockReusesGuards(t *testing.T) {
 	agent := &mockAgent{lockBody: LockState{Locked: true, UnlockCount: 2}}
 	startMockAgent(t, agent)
-	startMockRecoverd(t, &mockRecoverd{})
 	mgr := &dbusManager{s: newBootloaderServer(t)}
 
+	agent.body = `{"ok":false,"message":"Incorrect PIN. Bootloader unlock was not allowed."}`
 	ok, msg, derr := mgr.ArmBootloaderUnlock(true, "9999")
 	if derr != nil {
 		t.Fatalf("unexpected D-Bus error: %v", derr)
@@ -588,13 +457,14 @@ func TestDBusArmBootloaderUnlockReusesGuards(t *testing.T) {
 	if ok {
 		t.Error("ok = true for a wrong PIN")
 	}
-	if msg != msgPINWrong {
-		t.Errorf("message = %q, want %q", msg, msgPINWrong)
+	if msg != "Incorrect PIN. Bootloader unlock was not allowed." {
+		t.Errorf("message = %q, want the agent refusal", msg)
 	}
-	if agent.callCount() != 0 {
-		t.Errorf("agent contacted %d times on a wrong PIN, want 0", agent.callCount())
+	if agent.callCount() != 1 {
+		t.Errorf("agent contacted %d times on a wrong PIN, want 1", agent.callCount())
 	}
 
+	agent.body = ""
 	ok, msg, derr = mgr.ArmBootloaderUnlock(true, testPIN)
 	if derr != nil || !ok {
 		t.Fatalf("correct PIN: ok = %v, err = %v", ok, derr)
@@ -617,34 +487,10 @@ func TestDBusArmBootloaderUnlockReusesGuards(t *testing.T) {
 	}
 }
 
-// The broker must speak recoverd's protocol exactly: verify, the uid, the PIN.
-func TestRecoverdRequestShape(t *testing.T) {
-	startMockAgent(t, &mockAgent{})
-	rec := &mockRecoverd{}
-	startMockRecoverd(t, rec)
-	srv := newBootloaderServer(t)
-
-	if _, err := srv.setBootloaderUnlockArmed(true, testPIN, Origin{}, localPeer()); err != nil {
-		t.Fatalf("arm: %v", err)
-	}
-
-	got := rec.lastRequest()
-	want := []string{"verify", strconv.Itoa(os.Getuid()), testPIN}
-	if len(got) != len(want) {
-		t.Fatalf("recoverd saw %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("recoverd line %d = %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
 // The PIN must never reach the audit log, which is written to disk and read by
 // support flows.
 func TestPINNeverReachesAuditLog(t *testing.T) {
 	startMockAgent(t, &mockAgent{})
-	startMockRecoverd(t, &mockRecoverd{})
 
 	dir := t.TempDir()
 	srv, err := NewServer(dir)

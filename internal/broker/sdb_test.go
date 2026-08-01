@@ -124,13 +124,6 @@ func newSdbFixture(t *testing.T, serving bool) (*Server, *fakeSdbService, *fakeS
 
 	t.Setenv("USH_SDB_SOCK", sock.path)
 
-	// Dev unlocked by default; individual tests point the gate elsewhere.
-	gate := filepath.Join(dir, "dev.enabled")
-	if err := os.WriteFile(gate, nil, 0644); err != nil {
-		t.Fatalf("write gate: %v", err)
-	}
-	t.Setenv("USH_DEV_GATE", gate)
-
 	svc := &fakeSdbService{present: true, sock: sock}
 	prev := sdbControl
 	sdbControl = svc
@@ -181,33 +174,26 @@ func TestSdbReportsUnavailableWhenInitUnreachable(t *testing.T) {
 	}
 }
 
-// Availability is false when the unit is absent or dev is not unlocked, which is
-// what greys the control out in the desktop.
+// Availability follows the installed service, not the image build type. The
+// owner opt-in remains off until the switch asks the init to create it.
 func TestSdbAvailability(t *testing.T) {
 	cases := []struct {
 		name          string
 		present       bool
 		presentErr    error
-		devUnlocked   bool
 		serving       bool
 		wantAvailable bool
 		wantMessage   string
 	}{
-		{name: "installed and unlocked", present: true, devUnlocked: true, wantAvailable: true, wantMessage: msgSdbOff},
-		{name: "serving", present: true, devUnlocked: true, serving: true, wantAvailable: true, wantMessage: msgSdbOn},
-		{name: "unit absent", present: false, devUnlocked: true, wantMessage: msgSdbNotInstalled},
-		{name: "dev locked", present: true, devUnlocked: false, wantMessage: msgSdbDevLocked},
-		{name: "both missing", present: false, devUnlocked: false, wantMessage: msgSdbNotInstalled},
+		{name: "installed and off", present: true, wantAvailable: true, wantMessage: msgSdbOff},
+		{name: "serving", present: true, serving: true, wantAvailable: true, wantMessage: msgSdbOn},
+		{name: "unit absent", present: false, wantMessage: msgSdbNotInstalled},
 	}
 
 	for _, c := range cases {
 		srv, svc, _ := newSdbFixture(t, c.serving)
 		svc.present = c.present
 		svc.presentErr = c.presentErr
-		if !c.devUnlocked {
-			t.Setenv("USH_DEV_GATE", filepath.Join(t.TempDir(), "no-gate"))
-		}
-
 		available, active, msg := srv.sdbStatus()
 		if available != c.wantAvailable {
 			t.Errorf("%s: available = %v, want %v", c.name, available, c.wantAvailable)
@@ -227,20 +213,14 @@ func TestSdbEnableRefusedWhenUnavailable(t *testing.T) {
 	cases := []struct {
 		name        string
 		present     bool
-		devUnlocked bool
 		wantMessage string
 	}{
-		{name: "unit absent", present: false, devUnlocked: true, wantMessage: msgSdbNotInstalled},
-		{name: "dev locked", present: true, devUnlocked: false, wantMessage: msgSdbDevLocked},
+		{name: "unit absent", present: false, wantMessage: msgSdbNotInstalled},
 	}
 
 	for _, c := range cases {
 		srv, svc, _ := newSdbFixture(t, false)
 		svc.present = c.present
-		if !c.devUnlocked {
-			t.Setenv("USH_DEV_GATE", filepath.Join(t.TempDir(), "no-gate"))
-		}
-
 		ok, active, msg := srv.setSdbEnabled(true, Origin{}, localPeer())
 		if ok {
 			t.Errorf("%s: ok = true, want false", c.name)
@@ -389,24 +369,6 @@ func TestSdbUnverifiedPeerCannotSwitch(t *testing.T) {
 		if svc.callCount() != 0 {
 			t.Errorf("%s: service switched %d times, want 0", c.name, svc.callCount())
 		}
-	}
-}
-
-// Disabling must never be blocked by the development gate: a device whose gate
-// was removed while the bridge is up still needs the switch that closes it.
-func TestSdbDisableNotBlockedByDevGate(t *testing.T) {
-	srv, svc, _ := newSdbFixture(t, true)
-	t.Setenv("USH_DEV_GATE", filepath.Join(t.TempDir(), "no-gate"))
-
-	ok, active, _ := srv.setSdbEnabled(false, Origin{}, localPeer())
-	if !ok {
-		t.Error("disable refused because dev is locked, want it allowed")
-	}
-	if active {
-		t.Error("active = true after a successful disable")
-	}
-	if svc.callCount() != 1 {
-		t.Errorf("service switched %d times, want 1", svc.callCount())
 	}
 }
 

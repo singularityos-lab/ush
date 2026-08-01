@@ -2,18 +2,17 @@
 // Copyright (C) 2026 Mirko Brombin <brombin94@gmail.com>
 
 // bootloader.go relays bootloader-unlock consent to the privileged recovery
-// agent on /run/atom-recovery.sock (root:root, 0660). The desktop user cannot
-// open that socket; the broker, already privileged, makes the call on its behalf
-// so the agent keeps a single caller.
+// agent on /run/atom-recovery.sock (root:sinty-policy, 0660). The socket is
+// separate from the compositor and debug-bridge groups, and the root agent still
+// performs the authoritative owner check.
 //
 // Arming is gated three ways before the agent is contacted:
 //
 //   - origin must be local; a request from the debug bridge is refused, so a
 //     paired remote host cannot arm unlock even with a human at the local screen
 //   - peer credentials (SO_PEERCRED) must be the broker's own user
-//   - the PIN must verify against sinty-recoverd (see recoverd.go): any local
-//     process, including the sandboxed guest, can reach the control surface, so
-//     only the PIN proves the caller is the owner
+//   - the PIN must be well formed before it is relayed; the root recovery agent
+//     verifies it directly so one arm attempt consumes exactly one PIN attempt
 //
 // Disarming removes consent, so it is fail-safe: no PIN, remote callers allowed,
 // never blocked. A failed disarm is still reported as failed.
@@ -56,8 +55,6 @@ const (
 	msgRemoteRefused  = "Bootloader unlock cannot be armed over the debug bridge. Do it on the device itself."
 	msgPeerUnverified = "The request could not be attributed to your account and was refused."
 	msgPINRequired    = "Enter your PIN to allow bootloader unlock."
-	msgPINWrong       = "Incorrect PIN. Bootloader unlock was not allowed."
-	msgPINUnavailable = "Your PIN could not be checked right now. Nothing was changed."
 )
 
 // LockState is the bootloader lock state as reported by the recovery agent.
@@ -71,6 +68,11 @@ type LockState struct {
 type armReply struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
+}
+
+type armRequest struct {
+	Armed bool   `json:"armed"`
+	PIN   string `json:"pin,omitempty"`
 }
 
 // atomRecoveryClient speaks HTTP/1.1 to the agent over its unix socket. Keep
@@ -170,8 +172,9 @@ func (s *Server) setBootloaderUnlockArmed(
 			fmt.Errorf("caller identity could not be verified")
 	}
 
-	// Arming requires proof of ownership. Disarming deliberately does not: a user
-	// who cannot produce a PIN must still be able to take consent away.
+	// Arming requires proof of ownership. Reject malformed values here, then let
+	// the root agent perform the single authoritative PIN verification. Disarming
+	// deliberately needs no PIN so consent can always be taken away.
 	if armed {
 		if !pinWellFormed(pin) {
 			ushlog.Warn("broker: bootloader unlock arm rejected, PIN missing or malformed")
@@ -179,21 +182,13 @@ func (s *Server) setBootloaderUnlockArmed(
 			return armReply{OK: false, Message: msgPINRequired},
 				fmt.Errorf("a PIN is required to arm bootloader unlock")
 		}
-		ok, err := verifyPIN(os.Getuid(), pin)
-		if err != nil {
-			ushlog.Warn("broker: PIN verification unavailable", "err", err)
-			s.auditBootloader(action, "error", "pin_verify_failed", origin)
-			return armReply{OK: false, Message: msgPINUnavailable}, err
-		}
-		if !ok {
-			ushlog.Warn("broker: bootloader unlock arm refused, PIN did not verify")
-			s.auditBootloader(action, "deny", "pin_wrong", origin)
-			return armReply{OK: false, Message: msgPINWrong},
-				fmt.Errorf("PIN verification failed")
-		}
 	}
 
-	body, err := json.Marshal(map[string]bool{"armed": armed})
+	req := armRequest{Armed: armed}
+	if armed {
+		req.PIN = pin
+	}
+	body, err := json.Marshal(req)
 	if err != nil {
 		return armReply{}, fmt.Errorf("recovery agent: build body: %w", err)
 	}

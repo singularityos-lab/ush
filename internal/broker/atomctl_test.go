@@ -105,7 +105,7 @@ func startFakeInit(t *testing.T, f *fakeInit) {
 						return
 					}
 					atomWriteFrame(c, atomReply{OK: true, Units: units})
-				case "start", "stop", "sdb-enable", "sdb-disable":
+				case "start", "stop", "sdb-enable", "sdb-disable", "session-reboot", "session-poweroff":
 					if fail != "" {
 						atomWriteFrame(c, atomReply{Error: fail})
 						return
@@ -193,6 +193,41 @@ func TestAtomServiceIssuesOnlyStartAndStop(t *testing.T) {
 	}
 	if got[1].Cmd != "sdb-disable" || got[1].Unit != "" {
 		t.Errorf("second request = %+v, want sdb-disable", got[1])
+	}
+}
+
+func TestAtomSessionPowerUsesNarrowCommands(t *testing.T) {
+	f := &fakeInit{}
+	startFakeInit(t, f)
+
+	if err := atomSessionPower("session-reboot"); err != nil {
+		t.Fatalf("session-reboot: %v", err)
+	}
+	if err := atomSessionPower("session-poweroff"); err != nil {
+		t.Fatalf("session-poweroff: %v", err)
+	}
+	if err := atomSessionPower("restart"); err == nil {
+		t.Fatal("arbitrary init command accepted")
+	}
+
+	got := f.requests()
+	if len(got) != 2 {
+		t.Fatalf("requests = %d, want 2", len(got))
+	}
+	if got[0] != (atomRequest{Cmd: "session-reboot"}) {
+		t.Errorf("first request = %+v", got[0])
+	}
+	if got[1] != (atomRequest{Cmd: "session-poweroff"}) {
+		t.Errorf("second request = %+v", got[1])
+	}
+}
+
+func TestAtomSessionPowerFailsClosed(t *testing.T) {
+	f := &fakeInit{fail: "permission denied"}
+	startFakeInit(t, f)
+
+	if err := atomSessionPower("session-reboot"); err == nil {
+		t.Fatal("refused reboot reported success")
 	}
 }
 

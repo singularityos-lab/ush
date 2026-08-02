@@ -161,6 +161,20 @@ func (d *dbusManager) SetSdbEnabled(enabled bool) (bool, bool, string, *dbus.Err
 	return ok, active, message, nil
 }
 
+func (d *dbusManager) Reboot() *dbus.Error {
+	if err := atomSessionPower("session-reboot"); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
+func (d *dbusManager) PowerOff() *dbus.Error {
+	if err := atomSessionPower("session-poweroff"); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
 // sessionBusPeer is the identity of a management-bus caller. A session bus
 // connection is same-uid by construction: the bus socket lives in the user's
 // runtime dir and only that user can connect to it, so the peer is the broker's
@@ -236,6 +250,8 @@ var managementIntrospectXML = `
       <arg name="active" type="b" direction="out"/>
       <arg name="message" type="s" direction="out"/>
     </method>
+    <method name="Reboot"/>
+    <method name="PowerOff"/>
   </interface>
   <interface name="org.freedesktop.DBus.Introspectable">
     <method name="Introspect"><arg name="xml_data" type="s" direction="out"/></method>

@@ -129,6 +129,20 @@ func atomSDBControlCall(req atomRequest) (atomReply, error) {
 	return atomControlCallAt(atomSDBControlSocketPath(), req)
 }
 
+func atomSessionPower(cmd string) error {
+	if cmd != "session-reboot" && cmd != "session-poweroff" {
+		return fmt.Errorf("unsupported session power action: %s", cmd)
+	}
+	rep, err := atomSDBControlCall(atomRequest{Cmd: cmd})
+	if err != nil {
+		return err
+	}
+	if !rep.OK {
+		return fmt.Errorf("init control: %s: %s", cmd, atomError(rep))
+	}
+	return nil
+}
+
 // atomSdbService controls the debug bridge unit through the init.
 type atomSdbService struct{}
 

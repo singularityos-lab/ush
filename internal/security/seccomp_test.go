@@ -58,6 +58,9 @@ func TestSafeDevPath(t *testing.T) {
 		"/dev/fd/1",
 		"/dev/pts/0",
 		"/dev/stdout",
+		"/dev/",
+		"/dev/tty",
+		"/dev/ptmx",
 	}
 
 	for _, path := range tests {
@@ -73,6 +76,8 @@ func TestUnsafeDevPath(t *testing.T) {
 		"/dev/sda",
 		"/dev/input/event0",
 		"/dev/shmattack",
+		"/dev/tty0",
+		"/dev/ttyUSB0",
 	}
 
 	for _, path := range tests {

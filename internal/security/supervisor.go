@@ -776,7 +776,7 @@ func (s *Supervisor) handleOpenat(n *seccompNotif) seccompNotifResp {
 		return allow
 	}
 
-	if isSafeDevPath(path) {
+	if isSafeDevPath(path) || flags&unix.O_DIRECTORY != 0 {
 		return allow
 	}
 
@@ -895,7 +895,7 @@ func isSafeDevPath(path string) bool {
 		}
 	}
 	switch path {
-	case "/dev/shm", "/dev/fd", "/dev/pts", "/dev/stdin", "/dev/stdout", "/dev/stderr":
+	case "/dev", "/dev/", "/dev/tty", "/dev/ptmx", "/dev/shm", "/dev/fd", "/dev/pts", "/dev/stdin", "/dev/stdout", "/dev/stderr":
 		return true
 	default:
 		return false

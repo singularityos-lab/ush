@@ -33,14 +33,16 @@ import (
 
 // Shell is the main ush shell.
 type Shell struct {
-	runner    *interp.Runner
-	parser    *syntax.Parser
-	pkgMgr    *pkg.Manager
-	sessionID string
-	histFile  string
-	stdin     io.Reader
-	stdout    io.Writer
-	stderr    io.Writer
+	runner      *interp.Runner
+	parser      *syntax.Parser
+	pkgMgr      *pkg.Manager
+	sessionID   string
+	histFile    string
+	stdin       io.Reader
+	stdout      io.Writer
+	stderr      io.Writer
+	jobs        jobTable
+	interactive bool
 }
 
 // Config describes the shell configuration options.
@@ -84,6 +86,7 @@ func New(cfg *Config) (*Shell, error) {
 
 	runner, err := interp.New(
 		interp.StdIO(stdin, stdout, stderr),
+		interp.CallHandler(jobCallHandler),
 		interp.ExecHandlers(sh.execHandler),
 		interp.OpenHandler(openHandler),
 	)
@@ -107,8 +110,11 @@ func (sh *Shell) RunInteractive(ctx context.Context) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGTSTP)
 	defer signal.Stop(sigCh)
+	sh.interactive = true
+	defer func() { sh.interactive = false }()
 
 	for {
+		sh.jobs.report(sh.stderr)
 		line, err := rl.Readline(sh.prompt())
 		if err != nil {
 			if err == io.EOF {
@@ -143,6 +149,9 @@ func (sh *Shell) RunLine(ctx context.Context, line string) error {
 	if err != nil {
 		return fmt.Errorf("parse: %w", err)
 	}
+	if sh.interactive {
+		detachBackgroundStdin(f)
+	}
 	return sh.runner.Run(ctx, f)
 }
 
@@ -166,6 +175,11 @@ func (sh *Shell) execHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc
 		}
 
 		cmd := filepath.Base(args[0])
+
+		switch args[0] {
+		case "ush:fg", "ush:bg", "ush:jobs":
+			return sh.builtinJob(ctx, strings.TrimPrefix(args[0], "ush:"), args[1:])
+		}
 
 		// no running apt/dpkg by hand
 		switch cmd {
@@ -239,8 +253,27 @@ func (sh *Shell) execHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc
 			return execGitWithNamespaceIdentity(ctx, args)
 		}
 
+		if handled, err := sh.runForeground(ctx, args); handled {
+			return err
+		}
 		return next(ctx, args)
 	}
+}
+
+func detachBackgroundStdin(f *syntax.File) {
+	syntax.Walk(f, func(n syntax.Node) bool {
+		st, ok := n.(*syntax.Stmt)
+		if !ok || !st.Background {
+			return true
+		}
+		for _, rd := range st.Redirs {
+			if (rd.N == nil || rd.N.Value == "0") && (rd.Op == syntax.RdrIn || rd.Op == syntax.RdrInOut || rd.Op == syntax.DplIn || rd.Op == syntax.Hdoc || rd.Op == syntax.DashHdoc || rd.Op == syntax.WordHdoc) {
+				return true
+			}
+		}
+		st.Redirs = append(st.Redirs, &syntax.Redirect{Op: syntax.RdrIn, Word: &syntax.Word{Parts: []syntax.WordPart{&syntax.Lit{Value: "/dev/null"}}}})
+		return true
+	})
 }
 
 func execGitWithNamespaceIdentity(ctx context.Context, args []string) error {
@@ -933,6 +966,9 @@ func completeFiles(prefix string) []string {
 }
 
 func (sh *Shell) afterLine(err error) (exit bool, report error) {
+	if errors.Is(err, errInterrupted) {
+		return false, nil
+	}
 	if sh.runner.Exited() || errors.Is(err, errShellRestart) {
 		return true, nil
 	}

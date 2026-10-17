@@ -43,6 +43,7 @@ type Shell struct {
 	stderr      io.Writer
 	jobs        jobTable
 	interactive bool
+	jobControl  bool
 }
 
 // Config describes the shell configuration options.
@@ -112,6 +113,7 @@ func (sh *Shell) RunInteractive(ctx context.Context) error {
 	defer signal.Stop(sigCh)
 	sh.interactive = true
 	defer func() { sh.interactive = false }()
+	sh.initJobControl()
 
 	for {
 		sh.jobs.report(sh.stderr)

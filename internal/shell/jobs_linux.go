@@ -81,8 +81,30 @@ func isTerminal(fd int) bool {
 	return err == nil
 }
 
+func (sh *Shell) initJobControl() {
+	sh.jobControl = false
+	fd := fileFd(sh.stdin)
+	if !isTerminal(fd) {
+		return
+	}
+	pgrp, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
+	if err != nil || pgrp != unix.Getpgrp() {
+		return
+	}
+	pid := unix.Getpid()
+	if unix.Getpgrp() != pid {
+		if err := unix.Setpgid(0, 0); err != nil {
+			return
+		}
+	}
+	if err := setForeground(fd, pid); err != nil {
+		return
+	}
+	sh.jobControl = true
+}
+
 func (sh *Shell) foregroundTerminal(hc interp.HandlerContext) (int, bool) {
-	if !sh.interactive {
+	if !sh.interactive || !sh.jobControl {
 		return -1, false
 	}
 	in, out := fileFd(hc.Stdin), fileFd(hc.Stdout)

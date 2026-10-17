@@ -20,6 +20,20 @@ func TestJobControlHelper(t *testing.T) {
 	if os.Getenv("USH_JOB_HELPER") != "1" {
 		t.Skip("helper")
 	}
+	if os.Getenv("USH_JOB_NESTED") == "1" && os.Getenv("USH_JOB_INNER") != "1" {
+		inner := exec.Command(os.Args[0], "-test.run=^TestJobControlHelper$")
+		inner.Env = append(os.Environ(), "USH_JOB_INNER=1")
+		inner.Stdin, inner.Stdout, inner.Stderr = os.Stdin, os.Stdout, os.Stderr
+		inner.SysProcAttr = &syscall.SysProcAttr{
+			Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWPID,
+			UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
+			GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
+		}
+		if err := inner.Run(); err != nil {
+			os.Stdout.WriteString("nested-unavailable " + err.Error() + "\n")
+		}
+		return
+	}
 	sh, err := New(&Config{StorageDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
@@ -50,10 +64,21 @@ func (l *ptyLog) wait(t *testing.T, want string, from int) int {
 }
 
 func TestJobControlOnPty(t *testing.T) {
+	runJobControl(t, false)
+}
+
+func TestJobControlInPidNamespace(t *testing.T) {
+	runJobControl(t, true)
+}
+
+func runJobControl(t *testing.T, nested bool) {
 	master, slave := openPty(t)
 	defer master.Close()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestJobControlHelper$")
 	cmd.Env = append(os.Environ(), "USH_JOB_HELPER=1")
+	if nested {
+		cmd.Env = append(cmd.Env, "USH_JOB_NESTED=1")
+	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = slave, slave, slave
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
@@ -82,6 +107,16 @@ func TestJobControlOnPty(t *testing.T) {
 		}
 	}
 	pos := log.wait(t, "USH", 0)
+	if nested {
+		send("cut -d' ' -f5 /proc/$PPID/stat; echo $$\r")
+		pos = log.wait(t, "\r\n1\r\n", pos)
+		log.mu.Lock()
+		unavailable := strings.Contains(log.buf.String(), "nested-unavailable")
+		log.mu.Unlock()
+		if unavailable {
+			t.Skip("no user and pid namespaces")
+		}
+	}
 	send("sleep 30\r")
 	time.Sleep(300 * time.Millisecond)
 	send("\x1a")

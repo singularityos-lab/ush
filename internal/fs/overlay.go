@@ -1195,6 +1195,7 @@ func (g *GuestFS) setupVar() error {
 	// First try direct overlay on /var (works if /var is on tmpfs).
 	if err := g.setupOverlay("var"); err == nil {
 		ensureVarWritable(varDst)
+		bindLiveHostVar(varDst)
 		return nil
 	}
 
@@ -1253,8 +1254,28 @@ func (g *GuestFS) setupVar() error {
 	// Debian sources.list (e.g. a Debian-derivative host).
 	// Always clear them: apt-get update recreates them in seconds.
 	invalidateAptLists(varDst) //nolint:errcheck
+	bindLiveHostVar(varDst)
 
 	return nil
+}
+
+var liveHostVarDirs = []string{"lib/singularity"}
+
+func bindLiveHostVar(varDst string) {
+	for _, d := range liveHostVarDirs {
+		src := filepath.Join("/var", d)
+		if fi, err := os.Stat(src); err != nil || !fi.IsDir() {
+			continue
+		}
+		dst := filepath.Join(varDst, d)
+		if err := os.MkdirAll(dst, 0o755); err != nil {
+			ushlog.Debug("fs: live /var dir", "dir", d, "err", err)
+			continue
+		}
+		if err := bindMount(src, dst, true); err != nil {
+			ushlog.Debug("fs: live /var bind", "dir", d, "err", err)
+		}
+	}
 }
 
 // ensureVarWritable gives the guest a writable /var/log, /var/cache and /var/tmp

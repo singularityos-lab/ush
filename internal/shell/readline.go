@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
@@ -33,6 +34,7 @@ type Readline struct {
 	// cursor before clearing on the next redraw so that wrapped lines are
 	// erased instead of being left behind.
 	lastCursorRow int
+	pending       []byte
 }
 
 // newReadline creates a new Readline instance.
@@ -90,17 +92,27 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 	histIdx := len(rl.history)
 	savedLine := ""
 
+	chunk := make([]byte, 256)
 	for {
-		b := make([]byte, 4)
-		n, err := os.Stdin.Read(b)
-		if err != nil {
-			if err == io.EOF && len(buf) == 0 {
-				fmt.Fprint(os.Stdout, "\r\n")
-				return "", io.EOF
+		b, rest, ok := nextKey(rl.pending)
+		if !ok {
+			n, err := os.Stdin.Read(chunk)
+			if n > 0 {
+				rl.pending = append(rl.pending, chunk[:n]...)
+				continue
 			}
-			return string(buf), err
+			if len(rl.pending) > 0 {
+				b, rest = rl.pending, nil
+			} else {
+				if err == io.EOF && len(buf) == 0 {
+					fmt.Fprint(os.Stdout, "\r\n")
+					return "", io.EOF
+				}
+				return string(buf), err
+			}
 		}
-		b = b[:n]
+		rl.pending = rest
+		n := len(b)
 
 		switch {
 		// Enter
@@ -260,6 +272,41 @@ func (rl *Readline) Readline(prompt string) (string, error) {
 			rl.redrawLine(prompt, buf, pos)
 		}
 	}
+}
+
+func nextKey(p []byte) (key, rest []byte, ok bool) {
+	if len(p) == 0 {
+		return nil, p, false
+	}
+	if p[0] == 27 {
+		if len(p) == 1 {
+			return p[:1], p[1:], true
+		}
+		if p[1] != '[' {
+			return p[:1], p[1:], true
+		}
+		for i := 2; i < len(p); i++ {
+			if p[i] >= 0x40 && p[i] <= 0x7e {
+				return p[:i+1], p[i+1:], true
+			}
+		}
+		return nil, p, false
+	}
+	if p[0] < 32 || p[0] == 127 {
+		return p[:1], p[1:], true
+	}
+	i := 0
+	for i < len(p) && p[i] >= 32 && p[i] != 127 {
+		if !utf8.FullRune(p[i:]) {
+			break
+		}
+		_, size := utf8.DecodeRune(p[i:])
+		i += size
+	}
+	if i == 0 {
+		return nil, p, false
+	}
+	return p[:i], p[i:], true
 }
 
 // redrawLine redraws the current line, accounting for wrapping when the

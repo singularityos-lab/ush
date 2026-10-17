@@ -127,11 +127,12 @@ func (sh *Shell) RunInteractive(ctx context.Context) error {
 			continue
 		}
 
-		if err := sh.RunLine(ctx, line); err != nil {
-			if isExitError(err) || errors.Is(err, errShellRestart) {
-				return nil
-			}
-			fmt.Fprintf(sh.stderr, "USH: %v\n", err)
+		exit, report := sh.afterLine(sh.RunLine(ctx, line))
+		if exit {
+			return nil
+		}
+		if report != nil {
+			fmt.Fprintf(sh.stderr, "USH: %v\n", report)
 		}
 	}
 }
@@ -931,12 +932,14 @@ func completeFiles(prefix string) []string {
 	return matches
 }
 
-func isExitError(err error) bool {
-	if err == nil {
-		return false
+func (sh *Shell) afterLine(err error) (exit bool, report error) {
+	if sh.runner.Exited() || errors.Is(err, errShellRestart) {
+		return true, nil
 	}
-	_, ok := interp.IsExitStatus(err)
-	return ok && err.Error() == "exit status 0"
+	if _, ok := interp.IsExitStatus(err); ok {
+		return false, nil
+	}
+	return false, err
 }
 
 func isInterrupt(err error) bool {

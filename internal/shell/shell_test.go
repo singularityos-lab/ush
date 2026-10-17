@@ -4,6 +4,7 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -104,9 +105,29 @@ func TestCompletePermCategories(t *testing.T) {
 	}
 }
 
-func TestIsExitError(t *testing.T) {
-	if isExitError(nil) {
-		t.Error("nil is not an exit error")
+func TestAfterLine(t *testing.T) {
+	cases := []struct {
+		line   string
+		exit   bool
+		report bool
+	}{
+		{"true", false, false},
+		{"false", false, false},
+		{"echo abc | grep -q zzz", false, false},
+		{"exit 3", true, false},
+		{"exit", true, false},
+		{"echo 'unterminated", false, true},
+	}
+	for _, c := range cases {
+		var out bytes.Buffer
+		sh, err := New(&Config{StorageDir: t.TempDir(), Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+		if err != nil {
+			t.Fatal(err)
+		}
+		exit, report := sh.afterLine(sh.RunLine(context.Background(), c.line))
+		if exit != c.exit || (report != nil) != c.report {
+			t.Errorf("%q: exit %v report %v, want exit %v report %v", c.line, exit, report, c.exit, c.report)
+		}
 	}
 }
 

@@ -893,6 +893,7 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		os.MkdirAll(filepath.Join(aptState, "archives", "partial"), 0755) //nolint:errcheck
 		os.MkdirAll(filepath.Join(aptState, "log"), 0755)                 //nolint:errcheck
 		os.MkdirAll(filepath.Join(aptState, "cache"), 0755)               //nolint:errcheck
+		moveAsideUnwritable(filepath.Join(aptState, "log"), "term.log", "history.log", "eipp.log.xz")
 		// Point apt's whole state/cache/log tree at the writable dir: besides the
 		// lists, apt also writes extended_states (Dir::State) and term/eipp logs
 		// (Dir::Log), both of which live under the read-only /var on the guest.
@@ -1394,3 +1395,17 @@ func (m *Manager) InspectJSON(pkg string) (*PackageInfo, error) {
 
 // MarshalJSON for ScriptRisk (already a string, no override needed).
 var _ = json.Marshal
+
+func moveAsideUnwritable(dir string, names ...string) {
+	for _, name := range names {
+		p := filepath.Join(dir, name)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+		if err == nil {
+			f.Close()
+			continue
+		}
+		if os.IsPermission(err) {
+			os.Rename(p, p+".unwritable")
+		}
+	}
+}

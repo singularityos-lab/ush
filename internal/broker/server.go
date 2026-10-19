@@ -98,6 +98,24 @@ func (d *dbusManager) IsDirTrusted(path string) (bool, *dbus.Error) {
 	return d.s.isDirTrusted(path), nil
 }
 
+func (d *dbusManager) TrustDevDir(path string) *dbus.Error {
+	if err := d.s.trustDirAs(path, policy.CategoryDevDirDev); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
+func (d *dbusManager) UntrustDevDir(path string) *dbus.Error {
+	if err := d.s.untrustDirAs(path, policy.CategoryDevDirDev); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
+func (d *dbusManager) IsDevDirTrusted(path string) (bool, *dbus.Error) {
+	return d.s.isDirTrustedAs(path, policy.CategoryDevDirDev), nil
+}
+
 func (d *dbusManager) ListDevDirs() (string, *dbus.Error) {
 	return d.s.listDevDirs(), nil
 }
@@ -219,6 +237,12 @@ var managementIntrospectXML = `
     <method name="TrustDir"><arg name="path" type="s" direction="in"/></method>
     <method name="UntrustDir"><arg name="path" type="s" direction="in"/></method>
     <method name="IsDirTrusted">
+      <arg name="path" type="s" direction="in"/>
+      <arg name="trusted" type="b" direction="out"/>
+    </method>
+    <method name="TrustDevDir"><arg name="path" type="s" direction="in"/></method>
+    <method name="UntrustDevDir"><arg name="path" type="s" direction="in"/></method>
+    <method name="IsDevDirTrusted">
       <arg name="path" type="s" direction="in"/>
       <arg name="trusted" type="b" direction="out"/>
     </method>
@@ -801,11 +825,15 @@ func (s *Server) setDevShellEnabled(on bool) error {
 
 // isDirTrusted reports whether path is at or below a trusted developer directory.
 func (s *Server) isDirTrusted(path string) bool {
+	return s.isDirTrustedAs(path, devDirCategory)
+}
+
+func (s *Server) isDirTrustedAs(path string, category policy.Category) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	path = strings.TrimRight(path, "/")
 	for _, r := range s.policy.List() {
-		if r.Category != devDirCategory || r.Decision != policy.DecisionAllow {
+		if r.Category != category || r.Decision != policy.DecisionAllow {
 			continue
 		}
 		d := strings.TrimRight(r.Resource, "/")
@@ -814,6 +842,17 @@ func (s *Server) isDirTrusted(path string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) untrustDirAs(path string, category policy.Category) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policy.Remove(category, path)
+	if err := s.policy.Save(); err != nil {
+		return err
+	}
+	ushlog.Info("broker: developer directory untrusted", "path", path, "category", category)
+	return nil
 }
 
 // untrustDir revokes a directory's trust.

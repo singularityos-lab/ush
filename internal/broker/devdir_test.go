@@ -67,3 +67,27 @@ func TestSyncDevDirs(t *testing.T) {
 		t.Error("syncDevDirs(ush) without confirmation should fail")
 	}
 }
+
+func TestDevDirDBusMethods(t *testing.T) {
+	srv, err := NewServer(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &dbusManager{s: srv}
+	dir := t.TempDir()
+	if derr := d.TrustDevDir(dir); derr != nil {
+		t.Fatal(derr)
+	}
+	if ok, _ := d.IsDevDirTrusted(dir); !ok {
+		t.Error("IsDevDirTrusted = false after TrustDevDir")
+	}
+	if ok, _ := d.IsDirTrusted(dir); ok {
+		t.Error("a dev-only dir must not count as shared with ush")
+	}
+	if derr := d.UntrustDevDir(dir); derr != nil {
+		t.Fatal(derr)
+	}
+	if ok, _ := d.IsDevDirTrusted(dir); ok {
+		t.Error("IsDevDirTrusted = true after UntrustDevDir")
+	}
+}

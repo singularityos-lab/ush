@@ -6,6 +6,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -44,12 +48,12 @@ func TestLastWord(t *testing.T) {
 }
 
 func TestCompleteFiles(t *testing.T) {
-	results := completeFiles("")
+	results := completeFiles("", "")
 	if len(results) == 0 {
 		t.Error("completeFiles('') should list current directory")
 	}
 
-	results = completeFiles("/")
+	results = completeFiles("/", "")
 	if len(results) == 0 {
 		t.Error("completeFiles('/') should list root directory")
 	}
@@ -155,5 +159,32 @@ func TestEnvWithOverrides(t *testing.T) {
 	}
 	if strings.Contains(joined, "\nUSH_PRELOAD_IDENTITY=host\n") {
 		t.Fatalf("env kept old preload identity: %v", env)
+	}
+}
+
+func TestCompleteFilesUsesShellDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "trama"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "trace.txt"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".tracked"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := completeFiles("tra", dir)
+	sort.Strings(got)
+	if want := []string{"trace.txt", "trama/"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("completeFiles(tra) = %v, want %v", got, want)
+	}
+	if got := completeFiles("sub/tr", dir); got != nil {
+		t.Errorf("completeFiles(sub/tr) = %v, want nil", got)
+	}
+}
+
+func TestRuneWidth(t *testing.T) {
+	if got := visibleLen("\x1b[1;32mmirko\x1b[0m@\U0001F527DSH:"); got != 12 {
+		t.Errorf("visibleLen = %d, want 12", got)
 	}
 }

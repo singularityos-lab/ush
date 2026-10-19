@@ -369,6 +369,13 @@ func openHandler(ctx context.Context, path string, flag int, perm os.FileMode) (
 	return interp.DefaultOpenHandler()(ctx, path, flag, perm)
 }
 
+func (sh *Shell) cwd() string {
+	if sh.runner != nil {
+		return sh.runner.Dir
+	}
+	return ""
+}
+
 // prompt builds the shell prompt.
 func (sh *Shell) prompt() string {
 	cwd := ""
@@ -439,7 +446,7 @@ func (sh *Shell) completionFunc() CompletionFunc {
 				}
 			}
 			// After pkg subcommand, complete file paths.
-			completions = completeFiles(word)
+			completions = completeFiles(word, sh.cwd())
 			return line[:pos-len(word)], completions, line[pos:]
 		}
 
@@ -459,7 +466,7 @@ func (sh *Shell) completionFunc() CompletionFunc {
 		}
 
 		// File/path completion.
-		completions = completeFiles(word)
+		completions = completeFiles(word, sh.cwd())
 		return line[:pos-len(word)], completions, line[pos:]
 	}
 }
@@ -786,7 +793,18 @@ func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
 
 	// perm list-dirs
 	if args[0] == "list-dirs" {
-		fmt.Fprintln(hc.Stdout, client.ListDevDirs())
+		var dirs []string
+		if err := json.Unmarshal([]byte(client.ListDevDirs()), &dirs); err != nil {
+			fmt.Fprintln(hc.Stdout, client.ListDevDirs())
+			return nil
+		}
+		if len(dirs) == 0 {
+			fmt.Fprintln(hc.Stdout, "perm: no trusted dev dirs")
+			return nil
+		}
+		for _, d := range dirs {
+			fmt.Fprintln(hc.Stdout, d)
+		}
 		return nil
 	}
 
@@ -935,17 +953,28 @@ func completeCommands(prefix string) []string {
 }
 
 // completeFiles completes file paths.
-func completeFiles(prefix string) []string {
-	var dir, base string
-	if prefix == "" {
+func completeFiles(prefix, cwd string) []string {
+	if prefix == "~" {
+		return []string{"~/"}
+	}
+	typedDir, base := "", prefix
+	if i := strings.LastIndex(prefix, "/"); i >= 0 {
+		typedDir, base = prefix[:i+1], prefix[i+1:]
+	}
+	dir := typedDir
+	if strings.HasPrefix(dir, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			dir = home + dir[1:]
+		}
+	}
+	if dir == "" {
 		dir = "."
-		base = ""
-	} else if strings.HasSuffix(prefix, "/") {
-		dir = prefix
-		base = ""
-	} else {
-		dir = filepath.Dir(prefix)
-		base = filepath.Base(prefix)
+	}
+	if !filepath.IsAbs(dir) {
+		if cwd == "" {
+			cwd, _ = os.Getwd()
+		}
+		dir = filepath.Join(cwd, dir)
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -956,13 +985,14 @@ func completeFiles(prefix string) []string {
 	var matches []string
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, base) {
-			match := filepath.Join(dir, name)
-			if e.IsDir() {
-				match += "/"
-			}
-			matches = append(matches, match)
+		if !strings.HasPrefix(name, base) || (strings.HasPrefix(name, ".") && !strings.HasPrefix(base, ".")) {
+			continue
 		}
+		match := typedDir + name
+		if fi, err := os.Stat(filepath.Join(dir, name)); err == nil && fi.IsDir() {
+			match += "/"
+		}
+		matches = append(matches, match)
 	}
 	return matches
 }

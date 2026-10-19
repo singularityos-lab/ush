@@ -233,7 +233,7 @@ func (sh *Shell) execHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc
 		// Builtin dsh: switch this session to the developer world. Gated by a
 		// host-side broker confirmation, so sandboxed code cannot escalate itself.
 		if cmd == "dsh" {
-			return sh.builtinDsh(ctx)
+			return sh.builtinDsh(ctx, args[1:])
 		}
 
 		// Singularity Guard builtins (thin clients for the singd daemon).
@@ -530,6 +530,10 @@ func (sh *Shell) builtinPkg(ctx context.Context, args []string) error {
 // re-execs a fresh ush. It is recognized in RunInteractive.
 var errShellRestart = errors.New("ush: restart requested")
 
+func IsRestart(err error) bool {
+	return errors.Is(err, errShellRestart)
+}
+
 // builtinRestart requests a full ush restart: it drops a sentinel file that the
 // host-side parent checks after the guest exits, then breaks the shell loop so
 // the guest tears down. The parent re-execs a clean ush, applying any startup-only
@@ -560,7 +564,7 @@ func (sh *Shell) builtinRestart(ctx context.Context) error {
 // sentinel and breaks the shell loop, and the parent re-execs into the dev
 // profile (replace, same terminal). A guest process can trigger the dialog but
 // cannot confirm it, so it is not an escalation path for sandboxed code.
-func (sh *Shell) builtinDsh(ctx context.Context) error {
+func (sh *Shell) builtinDsh(ctx context.Context, args []string) error {
 	hc := interp.HandlerCtx(ctx)
 	if os.Getenv("USH_PROFILE") == "dev" {
 		fmt.Fprintln(hc.Stdout, "Already in the developer shell (dsh).")
@@ -589,7 +593,11 @@ func (sh *Shell) builtinDsh(ctx context.Context) error {
 		fmt.Fprintln(hc.Stderr, "     if it is just disabled, on the host run:  ush dsh enable")
 		return interp.NewExitStatus(1)
 	}
-	if err := os.WriteFile(df, []byte("1\n"), 0600); err != nil {
+	if args == nil {
+		args = []string{}
+	}
+	data, _ := json.Marshal(args)
+	if err := os.WriteFile(df, data, 0600); err != nil {
 		fmt.Fprintf(hc.Stderr, "dsh: %v\n", err)
 		return interp.NewExitStatus(1)
 	}

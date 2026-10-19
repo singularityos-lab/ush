@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -602,9 +603,14 @@ func runParent(cfg *config.Config) error {
 	// re-exec into the dev profile in place. On success this does not return.
 	if df := os.Getenv("USH_DSH_FILE"); df != "" {
 		if _, statErr := os.Stat(df); statErr == nil {
+			args, ok := dshArgs(df)
 			os.Remove(df)
 			ushlog.Info("ush: entering developer shell (dsh)")
-			if rerr := reexecSelf("dev"); rerr != nil {
+			rerr := reexecSelf("dev")
+			if ok {
+				rerr = reexecSelfWith("dev", args)
+			}
+			if rerr != nil {
 				return fmt.Errorf("dsh: %w", rerr)
 			}
 		}
@@ -641,6 +647,10 @@ func runParent(cfg *config.Config) error {
 // "become dsh" and same-profile restart land in the right world). On success it
 // does not return.
 func reexecSelf(profile string) error {
+	return reexecSelfWith(profile, os.Args[1:])
+}
+
+func reexecSelfWith(profile string, args []string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -655,7 +665,19 @@ func reexecSelf(profile string) error {
 	if profile != "" {
 		env = append(env, "USH_PROFILE="+profile)
 	}
-	return syscall.Exec(exe, os.Args, env)
+	return syscall.Exec(exe, append([]string{os.Args[0]}, args...), env)
+}
+
+func dshArgs(sentinel string) ([]string, bool) {
+	data, err := os.ReadFile(sentinel)
+	if err != nil {
+		return nil, false
+	}
+	var args []string
+	if json.Unmarshal(data, &args) != nil {
+		return nil, false
+	}
+	return args, true
 }
 
 // loadTrustedDevDirs reads the user-confirmed developer directories from the
@@ -951,7 +973,10 @@ func runGuestInit(cfg *config.Config) error {
 	// -c mode (also script-file mode: the parent reads `ush script.sh` on the
 	// host and forwards its contents here): run and exit, no banner.
 	if cmd := os.Getenv("USH_CMD"); cmd != "" {
-		return sh.RunLine(ctx, cmd)
+		if err := sh.RunLine(ctx, cmd); !shell.IsRestart(err) {
+			return err
+		}
+		return nil
 	}
 
 	// Non-interactive stdin (piped or redirected, e.g. `echo cmd | ush`): read

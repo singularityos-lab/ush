@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -35,6 +36,7 @@ type Readline struct {
 	// erased instead of being left behind.
 	lastCursorRow int
 	pending       []byte
+	kill          []rune
 }
 
 // newReadline creates a new Readline instance.
@@ -53,225 +55,538 @@ func (rl *Readline) Close() {
 	if rl.state != nil {
 		term.Restore(int(os.Stdin.Fd()), rl.state)
 	}
-	rl.saveHistory()
 }
 
 // Readline reads a line with the given prompt.
-// Supports:
-//   - Up/Down arrows for history
-//   - Ctrl+R for history search
-//   - Tab for completion
-//   - Ctrl+A/E for beginning/end of line
-//   - Ctrl+L to clear the screen
-//   - Ctrl+C for interrupt (returns error)
-//   - Ctrl+D on empty line for EOF
+// Supports the common bash/readline bindings:
+//   - Up/Down, Ctrl+P/N for history, Alt+< and Alt+> for its ends
+//   - Ctrl+R/Ctrl+S for incremental history search
+//   - Tab for completion, extending the common prefix of several matches
+//   - Ctrl+A/E, Home/End, Ctrl+B/F, Alt+B/F and Ctrl+Left/Right for moving
+//   - Ctrl+K/U/W, Alt+D, Alt+Backspace to kill and Ctrl+Y to yank back
+//   - Ctrl+T to transpose, Alt+. for the last argument of the previous line
+//   - Ctrl+L to clear the screen, Ctrl+C to interrupt, Ctrl+D for EOF
 func (rl *Readline) Readline(prompt string) (string, error) {
 	fd := int(os.Stdin.Fd())
 
-	// Enable raw mode only if stdin is a terminal.
-	if term.IsTerminal(fd) {
-		state, err := term.MakeRaw(fd)
-		if err != nil {
-			// Fallback: simple line read.
-			return rl.readLineSimple(prompt)
-		}
-		rl.state = state
-		defer func() {
-			term.Restore(fd, state)
-			rl.state = nil
-		}()
-	} else {
+	if !term.IsTerminal(fd) {
 		return rl.readLineSimple(prompt)
 	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return rl.readLineSimple(prompt)
+	}
+	rl.state = state
+	defer func() {
+		term.Restore(fd, state)
+		rl.state = nil
+	}()
 
 	fmt.Fprint(os.Stdout, prompt)
 	rl.lastCursorRow = 0
 
-	var buf []rune
-	var pos int
-	histIdx := len(rl.history)
-	savedLine := ""
-
-	chunk := make([]byte, 256)
+	e := &lineEditor{rl: rl, prompt: prompt, histIdx: len(rl.history)}
 	for {
-		b, rest, ok := nextKey(rl.pending)
-		if !ok {
-			n, err := os.Stdin.Read(chunk)
-			if n > 0 {
-				rl.pending = append(rl.pending, chunk[:n]...)
-				continue
-			}
-			if len(rl.pending) > 0 {
-				b, rest = rl.pending, nil
-			} else {
-				if err == io.EOF && len(buf) == 0 {
-					fmt.Fprint(os.Stdout, "\r\n")
-					return "", io.EOF
-				}
-				return string(buf), err
-			}
-		}
-		rl.pending = rest
-		n := len(b)
-
-		switch {
-		// Enter
-		case b[0] == '\r' || b[0] == '\n':
-			// "\r\n", not Fprintln: raw mode is still on here (Restore runs on
-			// the deferred return), so ONLCR is off and a bare \n drops a line
-			// without returning the carriage. The cursor would stay at the column
-			// where the typed command ended and the command's own output would
-			// start from there, indented by however much the user typed.
-			fmt.Fprint(os.Stdout, "\r\n")
-			line := string(buf)
-			if line != "" {
-				rl.addHistory(line)
-			}
-			return line, nil
-
-		// Ctrl+C
-		case b[0] == 3:
-			fmt.Fprint(os.Stdout, "\r\n")
-			buf = buf[:0]
-			pos = 0
-			return "", &interruptError{}
-
-		// Ctrl+D on empty line
-		case b[0] == 4:
-			if len(buf) == 0 {
+		b, err := rl.readKey()
+		if err != nil {
+			if err == io.EOF && len(e.buf) == 0 {
 				fmt.Fprint(os.Stdout, "\r\n")
 				return "", io.EOF
 			}
-			// Delete current character.
-			if pos < len(buf) {
-				buf = append(buf[:pos], buf[pos+1:]...)
-				rl.redrawLine(prompt, buf, pos)
-			}
-
-		// Ctrl+A (beginning of line)
-		case b[0] == 1:
-			pos = 0
-			rl.moveCursor(prompt, buf, pos)
-
-		// Ctrl+E (end of line)
-		case b[0] == 5:
-			pos = len(buf)
-			rl.moveCursor(prompt, buf, pos)
-
-		// Ctrl+L (clear screen)
-		case b[0] == 12:
-			fmt.Fprint(os.Stdout, "\033[2J\033[H")
-			rl.redrawLine(prompt, buf, pos)
-
-		// Ctrl+K (delete to end of line)
-		case b[0] == 11:
-			buf = buf[:pos]
-			rl.redrawLine(prompt, buf, pos)
-
-		// Ctrl+U (delete from beginning to cursor)
-		case b[0] == 21:
-			buf = buf[pos:]
-			pos = 0
-			rl.redrawLine(prompt, buf, pos)
-
-		// Ctrl+W (delete previous word)
-		case b[0] == 23:
-			if pos > 0 {
-				end := pos
-				for pos > 0 && unicode.IsSpace(buf[pos-1]) {
-					pos--
-				}
-				for pos > 0 && !unicode.IsSpace(buf[pos-1]) {
-					pos--
-				}
-				buf = append(buf[:pos], buf[end:]...)
-				rl.redrawLine(prompt, buf, pos)
-			}
-
-		// Tab (completion)
-		case b[0] == 9:
-			if rl.completion != nil {
-				line := string(buf)
-				head, completions, tail := rl.completion(line, len(string(buf[:pos])))
-				if len(completions) == 1 {
-					newLine := head + completions[0] + tail
-					buf = []rune(newLine)
-					pos = len([]rune(head + completions[0]))
-					rl.redrawLine(prompt, buf, pos)
-				} else if len(completions) > 1 {
-					fmt.Fprint(os.Stdout, "\r\n")
-					fmt.Fprint(os.Stdout, strings.Join(completions, "  ")+"\r\n")
-					rl.redrawLine(prompt, buf, pos)
-				}
-			}
-
-		// Backspace
-		case b[0] == 127 || b[0] == 8:
-			if pos > 0 {
-				buf = append(buf[:pos-1], buf[pos:]...)
-				pos--
-				rl.redrawLine(prompt, buf, pos)
-			}
-
-		// Escape sequences (arrows, etc.)
-		case b[0] == 27 && n >= 3 && b[1] == '[':
-			switch b[2] {
-			case 'A': // Up - previous history
-				if histIdx > 0 {
-					if histIdx == len(rl.history) {
-						savedLine = string(buf)
-					}
-					histIdx--
-					buf = []rune(rl.history[histIdx])
-					pos = len(buf)
-					rl.redrawLine(prompt, buf, pos)
-				}
-			case 'B': // Down - next history
-				if histIdx < len(rl.history) {
-					histIdx++
-					if histIdx == len(rl.history) {
-						buf = []rune(savedLine)
-					} else {
-						buf = []rune(rl.history[histIdx])
-					}
-					pos = len(buf)
-					rl.redrawLine(prompt, buf, pos)
-				}
-			case 'C': // Right
-				if pos < len(buf) {
-					pos++
-					rl.moveCursor(prompt, buf, pos)
-				}
-			case 'D': // Left
-				if pos > 0 {
-					pos--
-					rl.moveCursor(prompt, buf, pos)
-				}
-			case 'H': // Home
-				pos = 0
-				rl.moveCursor(prompt, buf, pos)
-			case 'F': // End
-				pos = len(buf)
-				rl.moveCursor(prompt, buf, pos)
-			case '3': // Delete (ESC [ 3 ~)
-				if n >= 4 && b[3] == '~' && pos < len(buf) {
-					buf = append(buf[:pos], buf[pos+1:]...)
-					rl.redrawLine(prompt, buf, pos)
-				}
-			}
-
-		// Normal printable characters
-		default:
-			r := []rune(string(b[:n]))
-			for _, ch := range r {
-				if ch >= 32 {
-					buf = append(buf[:pos], append([]rune{ch}, buf[pos:]...)...)
-					pos++
-				}
-			}
-			rl.redrawLine(prompt, buf, pos)
+			return string(e.buf), err
+		}
+		if done, line, err := e.handle(b); done {
+			return line, err
 		}
 	}
+}
+
+func (rl *Readline) readKey() ([]byte, error) {
+	chunk := make([]byte, 256)
+	for {
+		if key, rest, ok := nextKey(rl.pending); ok {
+			rl.pending = rest
+			return key, nil
+		}
+		n, err := os.Stdin.Read(chunk)
+		if n > 0 {
+			rl.pending = append(rl.pending, chunk[:n]...)
+			continue
+		}
+		if len(rl.pending) > 0 {
+			key := rl.pending
+			rl.pending = nil
+			return key, nil
+		}
+		if err == nil {
+			err = io.EOF
+		}
+		return nil, err
+	}
+}
+
+type lineEditor struct {
+	rl      *Readline
+	prompt  string
+	buf     []rune
+	pos     int
+	histIdx int
+	saved   string
+
+	searching   bool
+	searchBack  bool
+	query       []rune
+	lastQuery   []rune
+	matchIdx    int
+	failed      bool
+	searchStart []rune
+	searchPos   int
+
+	lastArgIdx int
+	lastKey    string
+}
+
+func (e *lineEditor) redraw() {
+	if e.searching {
+		label := "reverse-i-search"
+		if !e.searchBack {
+			label = "i-search"
+		}
+		if e.failed {
+			label = "failed " + label
+		}
+		e.rl.redrawLine("("+label+")`"+string(e.query)+"': ", e.buf, e.pos)
+		return
+	}
+	e.rl.redrawLine(e.prompt, e.buf, e.pos)
+}
+
+func (e *lineEditor) insert(rs []rune) {
+	e.buf = append(e.buf[:e.pos], append(append([]rune{}, rs...), e.buf[e.pos:]...)...)
+	e.pos += len(rs)
+}
+
+func (e *lineEditor) kill(from, to int) {
+	if from >= to {
+		return
+	}
+	e.rl.kill = append([]rune{}, e.buf[from:to]...)
+	e.buf = append(e.buf[:from], e.buf[to:]...)
+	e.pos = from
+}
+
+func (e *lineEditor) setLine(s string) {
+	e.buf = []rune(s)
+	e.pos = len(e.buf)
+}
+
+func (e *lineEditor) gotoHistory(idx int) {
+	if idx < 0 || idx > len(e.rl.history) || idx == e.histIdx {
+		return
+	}
+	if e.histIdx == len(e.rl.history) {
+		e.saved = string(e.buf)
+	}
+	e.histIdx = idx
+	if idx == len(e.rl.history) {
+		e.setLine(e.saved)
+	} else {
+		e.setLine(e.rl.history[idx])
+	}
+}
+
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+func (e *lineEditor) wordLeft() int {
+	p := e.pos
+	for p > 0 && !isWordRune(e.buf[p-1]) {
+		p--
+	}
+	for p > 0 && isWordRune(e.buf[p-1]) {
+		p--
+	}
+	return p
+}
+
+func (e *lineEditor) wordRight() int {
+	p := e.pos
+	for p < len(e.buf) && !isWordRune(e.buf[p]) {
+		p++
+	}
+	for p < len(e.buf) && isWordRune(e.buf[p]) {
+		p++
+	}
+	return p
+}
+
+func (e *lineEditor) handle(b []byte) (bool, string, error) {
+	k := keyName(b)
+	if e.searching {
+		if e.handleSearch(k, b) {
+			return false, "", nil
+		}
+		if k == "esc" {
+			return false, "", nil
+		}
+	}
+	defer func() { e.lastKey = k }()
+
+	switch k {
+	case "enter":
+		fmt.Fprint(os.Stdout, "\r\n")
+		line := string(e.buf)
+		if line != "" {
+			e.rl.addHistory(line)
+		}
+		return true, line, nil
+	case "ctrl-c":
+		fmt.Fprint(os.Stdout, "\r\n")
+		return true, "", &interruptError{}
+	case "ctrl-d":
+		if len(e.buf) == 0 {
+			fmt.Fprint(os.Stdout, "\r\n")
+			return true, "", io.EOF
+		}
+		if e.pos < len(e.buf) {
+			e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
+		}
+	case "delete":
+		if e.pos < len(e.buf) {
+			e.buf = append(e.buf[:e.pos], e.buf[e.pos+1:]...)
+		}
+	case "home", "ctrl-a":
+		e.pos = 0
+	case "end", "ctrl-e":
+		e.pos = len(e.buf)
+	case "left", "ctrl-b":
+		if e.pos > 0 {
+			e.pos--
+		}
+	case "right", "ctrl-f":
+		if e.pos < len(e.buf) {
+			e.pos++
+		}
+	case "word-left", "alt-b":
+		e.pos = e.wordLeft()
+	case "word-right", "alt-f":
+		e.pos = e.wordRight()
+	case "up", "ctrl-p":
+		e.gotoHistory(e.histIdx - 1)
+	case "down", "ctrl-n":
+		e.gotoHistory(e.histIdx + 1)
+	case "alt-<":
+		e.gotoHistory(0)
+	case "alt->":
+		e.gotoHistory(len(e.rl.history))
+	case "ctrl-l":
+		fmt.Fprint(os.Stdout, "\033[2J\033[H")
+		e.rl.lastCursorRow = 0
+	case "ctrl-k":
+		e.kill(e.pos, len(e.buf))
+	case "ctrl-u":
+		e.kill(0, e.pos)
+	case "ctrl-w":
+		p := e.pos
+		for p > 0 && unicode.IsSpace(e.buf[p-1]) {
+			p--
+		}
+		for p > 0 && !unicode.IsSpace(e.buf[p-1]) {
+			p--
+		}
+		e.kill(p, e.pos)
+	case "alt-backspace":
+		e.kill(e.wordLeft(), e.pos)
+	case "alt-d":
+		end := e.wordRight()
+		start := e.pos
+		e.kill(start, end)
+	case "ctrl-y":
+		e.insert(e.rl.kill)
+	case "ctrl-t":
+		if len(e.buf) >= 2 && e.pos > 0 {
+			p := e.pos
+			if p == len(e.buf) {
+				p--
+			}
+			e.buf[p-1], e.buf[p] = e.buf[p], e.buf[p-1]
+			e.pos = p + 1
+		}
+	case "alt-.":
+		e.yankLastArg()
+	case "backspace":
+		if e.pos > 0 {
+			e.buf = append(e.buf[:e.pos-1], e.buf[e.pos:]...)
+			e.pos--
+		}
+	case "tab":
+		e.complete()
+	case "ctrl-r", "ctrl-s":
+		e.startSearch(k == "ctrl-r")
+	case "text":
+		for _, ch := range string(b) {
+			if ch >= 32 {
+				e.insert([]rune{ch})
+			}
+		}
+	default:
+		return false, "", nil
+	}
+	e.redraw()
+	return false, "", nil
+}
+
+func (e *lineEditor) yankLastArg() {
+	if e.lastKey != "alt-." {
+		e.lastArgIdx = len(e.rl.history)
+	} else if e.lastArgIdx < len(e.rl.history) {
+		prev := lastWord(e.rl.history[e.lastArgIdx])
+		e.pos -= len([]rune(prev))
+		e.buf = append(e.buf[:e.pos], e.buf[e.pos+len([]rune(prev)):]...)
+	}
+	for e.lastArgIdx > 0 {
+		e.lastArgIdx--
+		if w := lastWord(e.rl.history[e.lastArgIdx]); w != "" {
+			e.insert([]rune(w))
+			return
+		}
+	}
+}
+
+func (e *lineEditor) complete() {
+	if e.rl.completion == nil {
+		return
+	}
+	line := string(e.buf)
+	cursor := len(string(e.buf[:e.pos]))
+	head, completions, tail := e.rl.completion(line, cursor)
+	seen := map[string]bool{}
+	var uniq []string
+	for _, c := range completions {
+		if !seen[c] {
+			seen[c] = true
+			uniq = append(uniq, c)
+		}
+	}
+	switch {
+	case len(uniq) == 1:
+		e.buf = []rune(head + uniq[0] + tail)
+		e.pos = len([]rune(head + uniq[0]))
+	case len(uniq) > 1:
+		common := commonPrefix(uniq)
+		typed := ""
+		if len(head) <= cursor {
+			typed = line[len(head):cursor]
+		}
+		if len(common) > len(typed) && strings.HasPrefix(common, typed) {
+			e.buf = []rune(head + common + tail)
+			e.pos = len([]rune(head + common))
+			return
+		}
+		fmt.Fprint(os.Stdout, "\r\n")
+		fmt.Fprint(os.Stdout, strings.Join(uniq, "  ")+"\r\n")
+		e.rl.lastCursorRow = 0
+	}
+}
+
+func commonPrefix(items []string) string {
+	p := items[0]
+	for _, s := range items[1:] {
+		for !strings.HasPrefix(s, p) {
+			_, size := utf8.DecodeLastRuneInString(p)
+			p = p[:len(p)-size]
+		}
+	}
+	return p
+}
+
+func (e *lineEditor) startSearch(back bool) {
+	e.searching = true
+	e.searchBack = back
+	e.query = nil
+	e.failed = false
+	e.matchIdx = len(e.rl.history)
+	e.searchStart = append([]rune{}, e.buf...)
+	e.searchPos = e.pos
+}
+
+func (e *lineEditor) find(from int, back bool) bool {
+	q := string(e.query)
+	for i := from; i >= 0 && i < len(e.rl.history); {
+		if j := strings.LastIndex(e.rl.history[i], q); j >= 0 {
+			e.matchIdx = i
+			e.buf = []rune(e.rl.history[i])
+			e.pos = len([]rune(e.rl.history[i][:j]))
+			e.histIdx = i
+			return true
+		}
+		if back {
+			i--
+		} else {
+			i++
+		}
+	}
+	return false
+}
+
+func (e *lineEditor) research(from int) {
+	if len(e.query) == 0 {
+		e.failed = false
+		return
+	}
+	e.failed = !e.find(from, e.searchBack)
+}
+
+func (e *lineEditor) handleSearch(k string, b []byte) bool {
+	switch k {
+	case "ctrl-r", "ctrl-s":
+		back := k == "ctrl-r"
+		if len(e.query) == 0 && len(e.lastQuery) > 0 {
+			e.query = append([]rune{}, e.lastQuery...)
+			e.searchBack = back
+			e.research(e.matchIdx - 1)
+			if !back {
+				e.research(e.matchIdx + 1)
+			}
+		} else {
+			e.searchBack = back
+			if back {
+				e.research(e.matchIdx - 1)
+			} else {
+				e.research(e.matchIdx + 1)
+			}
+		}
+	case "text":
+		for _, ch := range string(b) {
+			if ch < 32 {
+				continue
+			}
+			e.query = append(e.query, ch)
+			from := e.matchIdx
+			if from >= len(e.rl.history) {
+				from = len(e.rl.history) - 1
+			}
+			e.research(from)
+		}
+	case "backspace":
+		if len(e.query) > 0 {
+			e.query = e.query[:len(e.query)-1]
+		}
+		e.matchIdx = len(e.rl.history)
+		if len(e.query) == 0 {
+			e.buf = append([]rune{}, e.searchStart...)
+			e.pos = e.searchPos
+			e.failed = false
+		} else {
+			e.research(len(e.rl.history) - 1)
+		}
+	case "ctrl-g", "ctrl-c":
+		e.searching = false
+		e.buf = e.searchStart
+		e.pos = e.searchPos
+		e.histIdx = len(e.rl.history)
+	default:
+		e.searching = false
+		if len(e.query) > 0 {
+			e.lastQuery = append([]rune{}, e.query...)
+		}
+		e.redraw()
+		return false
+	}
+	e.redraw()
+	return true
+}
+
+func keyName(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	c := b[0]
+	switch {
+	case c == '\r' || c == '\n':
+		return "enter"
+	case c == 9:
+		return "tab"
+	case c == 127 || c == 8:
+		return "backspace"
+	case c == 27:
+		return escName(b)
+	case c < 32:
+		return "ctrl-" + string(rune('a'+c-1))
+	}
+	return "text"
+}
+
+func escName(b []byte) string {
+	if len(b) == 1 {
+		return "esc"
+	}
+	if b[1] == 'O' && len(b) == 3 {
+		switch b[2] {
+		case 'A':
+			return "up"
+		case 'B':
+			return "down"
+		case 'C':
+			return "right"
+		case 'D':
+			return "left"
+		case 'H':
+			return "home"
+		case 'F':
+			return "end"
+		}
+		return ""
+	}
+	if b[1] != '[' {
+		if len(b) == 2 {
+			switch b[1] {
+			case 127, 8:
+				return "alt-backspace"
+			}
+			if b[1] >= 32 && b[1] < 127 {
+				return "alt-" + string(rune(b[1]))
+			}
+		}
+		return ""
+	}
+	params, final := string(b[2:len(b)-1]), b[len(b)-1]
+	mod := ""
+	if i := strings.IndexByte(params, ';'); i >= 0 {
+		mod = params[i+1:]
+	}
+	word := mod == "5" || mod == "3"
+	switch final {
+	case 'A':
+		return "up"
+	case 'B':
+		return "down"
+	case 'C':
+		if word {
+			return "word-right"
+		}
+		return "right"
+	case 'D':
+		if word {
+			return "word-left"
+		}
+		return "left"
+	case 'H':
+		return "home"
+	case 'F':
+		return "end"
+	case '~':
+		switch params {
+		case "1", "7":
+			return "home"
+		case "4", "8":
+			return "end"
+		case "3":
+			return "delete"
+		}
+	}
+	return ""
 }
 
 func nextKey(p []byte) (key, rest []byte, ok bool) {
@@ -282,15 +597,23 @@ func nextKey(p []byte) (key, rest []byte, ok bool) {
 		if len(p) == 1 {
 			return p[:1], p[1:], true
 		}
-		if p[1] != '[' {
-			return p[:1], p[1:], true
-		}
-		for i := 2; i < len(p); i++ {
-			if p[i] >= 0x40 && p[i] <= 0x7e {
-				return p[:i+1], p[i+1:], true
+		switch {
+		case p[1] == '[':
+			for i := 2; i < len(p); i++ {
+				if p[i] >= 0x40 && p[i] <= 0x7e {
+					return p[:i+1], p[i+1:], true
+				}
 			}
+			return nil, p, false
+		case p[1] == 'O':
+			if len(p) < 3 {
+				return nil, p, false
+			}
+			return p[:3], p[3:], true
+		case p[1] >= 32 && p[1] <= 127, p[1] == 8:
+			return p[:2], p[2:], true
 		}
-		return nil, p, false
+		return p[:1], p[1:], true
 	}
 	if p[0] < 32 || p[0] == 127 {
 		return p[:1], p[1:], true
@@ -429,37 +752,50 @@ func (rl *Readline) readLineSimple(prompt string) (string, error) {
 	return "", io.EOF
 }
 
-// addHistory adds an entry to history (deduplicating consecutive entries).
+const maxHistory = 5000
+
+// addHistory adds an entry to history (deduplicating consecutive entries)
+// and appends it to the history file right away, so a closed terminal or a
+// second shell does not lose it.
 func (rl *Readline) addHistory(line string) {
 	if len(rl.history) > 0 && rl.history[len(rl.history)-1] == line {
 		return
 	}
 	rl.history = append(rl.history, line)
-	// Keep at most 5000 entries.
-	if len(rl.history) > 5000 {
-		rl.history = rl.history[len(rl.history)-5000:]
+	if len(rl.history) > maxHistory {
+		rl.history = rl.history[len(rl.history)-maxHistory:]
 	}
 	rl.histIdx = len(rl.history)
+	if rl.histFile == "" || strings.Contains(line, "\n") {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(rl.histFile), 0700); err != nil {
+		return
+	}
+	f, err := os.OpenFile(rl.histFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	if err != nil {
+		return
+	}
+	f.WriteString(line + "\n")
+	f.Close()
 }
 
-// loadHistory loads history from the file.
+// loadHistory loads history from the file, trimming it when it grew past
+// maxHistory entries.
 func (rl *Readline) loadHistory() {
 	data, err := os.ReadFile(rl.histFile)
 	if err != nil {
 		return
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, l := range lines {
+	for _, l := range strings.Split(string(data), "\n") {
 		if l != "" {
 			rl.history = append(rl.history, l)
 		}
 	}
-}
-
-// saveHistory saves history to the file.
-func (rl *Readline) saveHistory() {
-	os.MkdirAll(strings.TrimSuffix(rl.histFile, "/"+strings.Split(rl.histFile, "/")[len(strings.Split(rl.histFile, "/"))-1]), 0700)
-	os.WriteFile(rl.histFile, []byte(strings.Join(rl.history, "\n")+"\n"), 0600)
+	if len(rl.history) > maxHistory {
+		rl.history = rl.history[len(rl.history)-maxHistory:]
+		os.WriteFile(rl.histFile, []byte(strings.Join(rl.history, "\n")+"\n"), 0600)
+	}
 }
 
 type interruptError struct{}

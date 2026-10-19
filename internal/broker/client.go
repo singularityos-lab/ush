@@ -172,6 +172,39 @@ func (c *Client) UntrustDir(path string) error {
 	return nil
 }
 
+func (c *Client) AllowLan() error {
+	resp, err := c.callTimeout(rpcRequest{Method: "AllowLan"}, permissionReadDeadline)
+	if err != nil {
+		return fmt.Errorf("broker: allow local network: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("broker: %s", resp.Error)
+	}
+	return nil
+}
+
+func (c *Client) DenyLan() error {
+	resp, err := c.call(rpcRequest{Method: "DenyLan"})
+	if err != nil {
+		return fmt.Errorf("broker: deny local network: %w", err)
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("broker: %s", resp.Error)
+	}
+	return nil
+}
+
+func (c *Client) LanShared() (bool, error) {
+	resp, err := c.call(rpcRequest{Method: "LanStatus"})
+	if err != nil {
+		return false, fmt.Errorf("broker: local network status: %w", err)
+	}
+	if resp.Error != "" {
+		return false, fmt.Errorf("broker: %s", resp.Error)
+	}
+	return resp.Trusted, nil
+}
+
 // ListDevDirs returns the trusted developer directories as a JSON array string.
 func (c *Client) ListDevDirs() string {
 	resp, err := c.call(rpcRequest{Method: "ListDevDirs", Enable: os.Getenv("USH_PROFILE") == "dev"})

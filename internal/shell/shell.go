@@ -733,6 +733,7 @@ func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
 		fmt.Fprintln(hc.Stderr, "       perm untrust-dir [path] (revoke a dev dir's trust)")
 		fmt.Fprintln(hc.Stderr, "       perm sync-dirs          (share here the dev dirs trusted in the other shell)")
 		fmt.Fprintln(hc.Stderr, "       perm list-dirs          (list trusted dev dirs)")
+		fmt.Fprintln(hc.Stderr, "       perm lan on|off|status  (share this computer's network with ush)")
 		fmt.Fprintln(hc.Stderr, "  categories: network, filesystem, device, service")
 		return interp.NewExitStatus(1)
 	}
@@ -748,6 +749,48 @@ func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
 		return interp.NewExitStatus(1)
 	}
 	defer client.Close()
+
+	if args[0] == "lan" {
+		sub := "status"
+		if len(args) >= 2 {
+			sub = args[1]
+		}
+		switch sub {
+		case "on":
+			if err := client.AllowLan(); err != nil {
+				fmt.Fprintf(hc.Stderr, "perm lan: %v\n", err)
+				return interp.NewExitStatus(1)
+			}
+			fmt.Fprintln(hc.Stdout, "perm: ush now shares this computer's network; run 'restart' to apply it here")
+		case "off":
+			if err := client.DenyLan(); err != nil {
+				fmt.Fprintf(hc.Stderr, "perm lan: %v\n", err)
+				return interp.NewExitStatus(1)
+			}
+			fmt.Fprintln(hc.Stdout, "perm: ush is back on its own isolated network; run 'restart' to apply it here")
+		case "status":
+			on, err := client.LanShared()
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "perm lan: %v\n", err)
+				return interp.NewExitStatus(1)
+			}
+			active := os.Getenv("USH_LAN") == "1"
+			switch {
+			case on && active:
+				fmt.Fprintln(hc.Stdout, "lan: shared")
+			case on:
+				fmt.Fprintln(hc.Stdout, "lan: shared from the next session (run 'restart')")
+			case active:
+				fmt.Fprintln(hc.Stdout, "lan: isolated from the next session (run 'restart')")
+			default:
+				fmt.Fprintln(hc.Stdout, "lan: isolated")
+			}
+		default:
+			fmt.Fprintln(hc.Stderr, "usage: perm lan on|off|status")
+			return interp.NewExitStatus(1)
+		}
+		return nil
+	}
 
 	// perm trust <app>
 	if args[0] == "trust" {
@@ -928,7 +971,7 @@ func completePkgSubcommands(prefix string) []string {
 
 // completePermCategories completes perm categories.
 func completePermCategories(prefix string) []string {
-	cats := []string{"network", "filesystem", "device", "service", "trust", "untrust"}
+	cats := []string{"network", "filesystem", "device", "service", "trust", "untrust", "lan"}
 	var matches []string
 	for _, c := range cats {
 		if strings.HasPrefix(c, prefix) {

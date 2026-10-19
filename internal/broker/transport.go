@@ -175,6 +175,18 @@ func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{}
+	case "AllowLan":
+		if err := s.allowLan(); err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{}
+	case "DenyLan":
+		if err := s.denyLan(); err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{}
+	case "LanStatus":
+		return rpcResponse{Trusted: s.lanShared()}
 	case "UntrustDir":
 		if err := s.untrustDir(req.Resource); err != nil {
 			return rpcResponse{Error: err.Error()}

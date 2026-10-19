@@ -429,6 +429,14 @@ func runParent(cfg *config.Config) error {
 		nsCfg.EnableNet = false
 		enableNet = false
 		builtinNet = false
+	} else if lanShared(cfg.StorageDir) {
+		ushlog.Info("ush: sharing the host network (perm lan)")
+		nsCfg.EnableNet = false
+		enableNet = false
+		builtinNet = false
+		os.Setenv("USH_LAN", "1")
+	} else {
+		os.Unsetenv("USH_LAN")
 	}
 
 	// Inject the session ID into the child environment.
@@ -734,6 +742,14 @@ func startBrokerDirect() {
 	}
 }
 
+func lanShared(storageDir string) bool {
+	eng, err := policy.NewEngine(filepath.Join(storageDir, "policy.json"))
+	if err != nil {
+		return false
+	}
+	return policy.LanShared(eng)
+}
+
 func loadTrustedDevDirs(storageDir string) []string {
 	eng, err := policy.NewEngine(filepath.Join(storageDir, "policy.json"))
 	if err != nil {
@@ -895,7 +911,7 @@ func runGuestInit(cfg *config.Config) error {
 	// If in an isolated net namespace, bring up the TAP interface that pasta
 	// created from the parent side. Without this, the interface exists but
 	// is DOWN and no packets can flow. dsh shares the host network, so skip.
-	if cfg.EnableNetNamespace && os.Getenv("USH_PROFILE") != "dev" {
+	if cfg.EnableNetNamespace && os.Getenv("USH_PROFILE") != "dev" && os.Getenv("USH_LAN") != "1" {
 		configureGuestNetwork()
 	}
 

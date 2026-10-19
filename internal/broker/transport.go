@@ -217,6 +217,11 @@ func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{Permissions: perms}
+	case "OpenURI":
+		if err := s.openURI(req.Resource); err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{OK: true}
 	case "SdbElevate":
 		granted, reason := s.sdbElevate(req.Action, req.Detail, req.SessionID, parseOrigin(req.Origin))
 		return rpcResponse{OK: granted, Message: reason}

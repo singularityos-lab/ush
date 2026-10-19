@@ -284,3 +284,14 @@ func IsAvailable() bool {
 	_ = conn.Close()
 	return true
 }
+
+func (c *Client) OpenURI(uri string) error {
+	resp, err := c.call(rpcRequest{Method: "OpenURI", Resource: uri})
+	if err != nil {
+		return err
+	}
+	if resp.Error != "" {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}

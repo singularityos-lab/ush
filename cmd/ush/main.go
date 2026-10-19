@@ -57,6 +57,9 @@ func main() {
 	if isGosh() {
 		os.Exit(runGosh())
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "--open-uri" {
+		os.Exit(runOpenURI(os.Args[2:]))
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)
 		os.Exit(1)

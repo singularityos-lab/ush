@@ -69,6 +69,7 @@ func InstallSeccompFilter() error {
 		sysBpf           = 321
 		sysSetns         = 308
 		sysPerfEventOpen = 241
+		sysIoUringSetup  = 425
 		// New Linux mount API (kernel 5.2+) - more surface, block for hardening.
 		sysOpenTree     = 428
 		sysMoveMount    = 429
@@ -81,7 +82,7 @@ func InstallSeccompFilter() error {
 
 	blocked := []uint32{
 		sysPtrace, sysKexecLoad, sysKexecFileLd,
-		sysBpf, sysSetns, sysPerfEventOpen,
+		sysBpf, sysSetns, sysPerfEventOpen, sysIoUringSetup,
 		sysOpenTree, sysMoveMount, sysFsopen,
 		sysFsconfig, sysFsmount, sysFspick, sysMountSetattr,
 	}
@@ -208,14 +209,16 @@ func installSeccompNotifyFilter(relaxed bool) (notifFd int, err error) {
 	}
 	notifySyscalls := []uint32{
 		sysExecve, sysExecveat,
-		41,  // socket   (raw socket creation: ping, nmap, etc.)
-		42,  // connect  (network policy)
-		257, // openat   (device access under /dev/*)
-		165, // mount    (filesystem mount)
-		90,  // chmod    (strip +x on host-backed writes)
-		91,  // fchmod   (strip +x on host-backed writes)
-		268, // fchmodat (strip +x on host-backed writes)
-		452, // fchmodat2 (strip +x on host-backed writes, newer kernels)
+		41,          // socket   (raw socket creation: ping, nmap, etc.)
+		42,          // connect  (network policy)
+		257,         // openat   (device access under /dev/*)
+		165,         // mount    (filesystem mount)
+		90,          // chmod    (strip +x on host-backed writes)
+		91,          // fchmod   (strip +x on host-backed writes)
+		268,         // fchmodat (strip +x on host-backed writes)
+		452,         // fchmodat2 (strip +x on host-backed writes, newer kernels)
+		87, 84, 263, // unlink, rmdir, unlinkat (mass-deletion guard)
+		82, 264, 316, // rename, renameat, renameat2 (mass-deletion guard)
 	}
 
 	filter := buildNotifyFilter(notifySyscalls, directBlock)
@@ -236,6 +239,23 @@ func installSeccompNotifyFilter(relaxed bool) (notifFd int, err error) {
 	ushlog.Info("security: seccomp notify filter installed",
 		"notify_syscalls", len(notifySyscalls),
 		"blocked_syscalls", len(directBlock))
+	return int(fd), nil
+}
+
+// InstallDeleteGuardFilter installs, on the calling thread, a notify filter that
+// only covers unlink, rmdir and rename, for the host shell's deletion guard. It
+// also refuses io_uring, whose ring can unlink without these syscalls. The
+// caller must have set PR_SET_NO_NEW_PRIVS.
+func InstallDeleteGuardFilter() (int, error) {
+	filter := buildNotifyFilter([]uint32{87, 84, 263, 82, 264, 316}, []uint32{425})
+	prog := &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	fd, _, errno := unix.Syscall(unix.SYS_SECCOMP,
+		unix.SECCOMP_SET_MODE_FILTER,
+		unix.SECCOMP_FILTER_FLAG_NEW_LISTENER,
+		uintptr(unsafe.Pointer(prog)))
+	if errno != 0 {
+		return 0, fmt.Errorf("security: delete guard filter: %w", errno)
+	}
 	return int(fd), nil
 }
 

@@ -194,6 +194,17 @@ func (c *Client) DenyLan() error {
 	return nil
 }
 
+func (c *Client) ConfirmDelete(app, where string) (bool, error) {
+	resp, err := c.callTimeout(rpcRequest{Method: "ConfirmDelete", App: app, Resource: where}, permissionReadDeadline)
+	if err != nil {
+		return false, fmt.Errorf("broker: confirm deletion: %w", err)
+	}
+	if resp.Error != "" {
+		return false, fmt.Errorf("broker: %s", resp.Error)
+	}
+	return resp.Trusted, nil
+}
+
 func (c *Client) LanShared() (bool, error) {
 	resp, err := c.call(rpcRequest{Method: "LanStatus"})
 	if err != nil {

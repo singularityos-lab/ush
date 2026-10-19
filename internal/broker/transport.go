@@ -185,6 +185,8 @@ func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{}
+	case "ConfirmDelete":
+		return rpcResponse{Trusted: s.confirmMassDelete(req.App, req.Resource)}
 	case "LanStatus":
 		return rpcResponse{Trusted: s.lanShared()}
 	case "UntrustDir":

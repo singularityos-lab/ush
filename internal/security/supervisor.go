@@ -149,7 +149,7 @@ func tgidOf(tid uint32) int {
 // and nothing is retained (no fd leak). Real connect errors (ECONNREFUSED,
 // ENETUNREACH, EINPROGRESS for non-blocking) are propagated to the guest.
 func (s *Supervisor) connectViaPidfd(n *seccompNotif, family uint16, ip net.IP, port uint16) seccompNotifResp {
-	deny := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	// pidfd_open needs the thread-group leader (tgid), not a thread tid (which is
 	// what the notification carries when a worker thread makes the syscall, e.g.
@@ -182,7 +182,7 @@ func (s *Supervisor) connectViaPidfd(n *seccompNotif, family uint16, ip net.IP, 
 	}
 	if err := unix.Connect(int(hostFd), sa); err != nil {
 		if e, ok := err.(syscall.Errno); ok && e != 0 {
-			return seccompNotifResp{ID: n.ID, Error: int32(e)}
+			return seccompNotifResp{ID: n.ID, Error: -int32(e)}
 		}
 		return deny
 	}
@@ -228,6 +228,8 @@ type Supervisor struct {
 	// broker). They are exempt from exec stripping even when they sit under an
 	// execStrip prefix, so the user can build-and-run there on purpose.
 	execExempt atomic.Pointer[[]string]
+
+	delGuard atomic.Pointer[DeleteGuard]
 }
 
 // SetExecStripPrefixes records the host-backed read-write share prefixes under
@@ -330,6 +332,9 @@ func NewSupervisor(notifFd int, whitelist *ExecWhitelist) *Supervisor {
 // SetBrokerClient attaches a host-side broker client to the supervisor.
 // When set, sensitive syscalls trigger a permission dialog instead of
 // just being logged. Automatically switches out of permissive mode.
+// BrokerClient returns the attached broker client, nil until one is set.
+func (s *Supervisor) BrokerClient() *broker.Client { return s.brokerClient }
+
 func (s *Supervisor) SetBrokerClient(c *broker.Client) {
 	s.brokerClient = c
 	if !s.devMode.Load() {
@@ -427,8 +432,16 @@ func (s *Supervisor) handleNotif(n *seccompNotif) (seccompNotifResp, bool) {
 		sysFchmod    = 91
 		sysFchmodat  = 268
 		sysFchmodat2 = 452
+		sysUnlink    = 87
+		sysRmdir     = 84
+		sysUnlinkat  = 263
+		sysRename    = 82
+		sysRenameat  = 264
+		sysRenameat2 = 316
 	)
 	switch n.Data.Nr {
+	case sysUnlink, sysRmdir, sysUnlinkat, sysRename, sysRenameat, sysRenameat2:
+		return s.handleDelete(n), false
 	case sysExecve, sysExecveat:
 		return s.handleExecve(n), false
 	case sysSocket:
@@ -472,7 +485,7 @@ func (s *Supervisor) builtinSocket(n *seccompNotif) (seccompNotifResp, bool) {
 	denied := func() (seccompNotifResp, bool) {
 		// Respond with EPERM via a normal response (not SEND).
 		unix.Syscall(unix.SYS_IOCTL, uintptr(s.notifFd), ioctlNotifSend,
-			uintptr(unsafe.Pointer(&seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)})))
+			uintptr(unsafe.Pointer(&seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)})))
 		return seccompNotifResp{}, true
 	}
 
@@ -508,7 +521,7 @@ func (s *Supervisor) injectFdSend(id uint64, srcfd int) (int, error) {
 // the file the child would actually execute.
 func (s *Supervisor) handleExecve(n *seccompNotif) seccompNotifResp {
 	allowResp := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
-	denyResp := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	denyResp := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	// Fail closed when enforcing the whitelist: if we cannot read the path we
 	// cannot validate it, and an attacker can deliberately make the read fail
@@ -567,7 +580,7 @@ func (s *Supervisor) handleExecve(n *seccompNotif) seccompNotifResp {
 // gate them here - they require explicit broker approval.
 func (s *Supervisor) handleSocket(n *seccompNotif) seccompNotifResp {
 	allow := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
-	deny := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	domain := int(n.Data.Args[0])
 	sockType := int(n.Data.Args[1]) & 0xf // strip SOCK_NONBLOCK / SOCK_CLOEXEC flags
@@ -630,7 +643,7 @@ func (s *Supervisor) handleSocket(n *seccompNotif) seccompNotifResp {
 // If the supervisor is in permissive mode, all connections are logged and allowed.
 func (s *Supervisor) handleConnect(n *seccompNotif) seccompNotifResp {
 	allow := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
-	deny := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	// Fail closed when enforcing: an attacker can mask the real destination by
 	// making the sockaddr unreadable or out of range, then swapping it on the
@@ -760,7 +773,7 @@ func (s *Supervisor) allowConnect(n *seccompNotif, family uint16, ip net.IP, por
 // FS writes to /etc, /usr etc. are already blocked by Landlock.
 func (s *Supervisor) handleOpenat(n *seccompNotif) seccompNotifResp {
 	allow := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
-	deny := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	// arg1 = pathname pointer (arg0 = dirfd)
 	pathPtr := uintptr(n.Data.Args[1])
@@ -909,7 +922,7 @@ func isSafeDevPath(path string) bool {
 // pkg install uses bind mounts internally.
 func (s *Supervisor) handleMount(n *seccompNotif) seccompNotifResp {
 	allow := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
-	deny := seccompNotifResp{ID: n.ID, Error: int32(syscall.EPERM)}
+	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
 	// arg1 = target path pointer
 	targetPtr := uintptr(n.Data.Args[1])
@@ -1019,12 +1032,58 @@ func (s *Supervisor) handleChmod(n *seccompNotif) seccompNotifResp {
 			errno = syscall.EPERM
 		}
 		ushlog.Debug("security: exec-strip chmod failed", "path", absPath, "errno", errno)
-		return seccompNotifResp{ID: n.ID, Error: int32(errno)}
+		return seccompNotifResp{ID: n.ID, Error: -int32(errno)}
 	}
 	s.emit(guardproto.EventOpen, n.PID, absPath, "", "exec-bit-stripped")
 	ushlog.Debug("security: stripped exec bits on host-backed write",
 		"path", absPath, "mode", fmt.Sprintf("%#o->%#o", mode, uint32(masked)))
 	return seccompNotifResp{ID: n.ID, Error: 0} // success; syscall not executed
+}
+
+// SetDeleteGuard enables the mass-deletion guard on unlink, rmdir and rename.
+func (s *Supervisor) SetDeleteGuard(g *DeleteGuard) { s.delGuard.Store(g) }
+
+func (s *Supervisor) handleDelete(n *seccompNotif) seccompNotifResp {
+	cont := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
+	g := s.delGuard.Load()
+	if g == nil {
+		return cont
+	}
+	pid := int(n.PID)
+	var errno syscall.Errno
+	switch n.Data.Nr {
+	case 87, 84:
+		p, ok := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
+		if !ok {
+			return cont
+		}
+		errno = g.CheckDelete(pid, p)
+	case 263:
+		p, ok := resolveAtPath(pid, int(int32(n.Data.Args[0])), uintptr(n.Data.Args[1]))
+		if !ok {
+			return cont
+		}
+		errno = g.CheckDelete(pid, p)
+	case 82:
+		from, ok1 := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
+		to, ok2 := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[1]))
+		if !ok1 || !ok2 {
+			return cont
+		}
+		errno = g.CheckRename(pid, from, to)
+	default:
+		from, ok1 := resolveAtPath(pid, int(int32(n.Data.Args[0])), uintptr(n.Data.Args[1]))
+		to, ok2 := resolveAtPath(pid, int(int32(n.Data.Args[2])), uintptr(n.Data.Args[3]))
+		if !ok1 || !ok2 {
+			return cont
+		}
+		errno = g.CheckRename(pid, from, to)
+	}
+	if errno != 0 {
+		ushlog.Info("security: deletion refused", "pid", pid)
+		return seccompNotifResp{ID: n.ID, Error: -int32(errno)}
+	}
+	return cont
 }
 
 // resolveAtPath turns a (dirfd, pathptr) pair from the guest into a guest-

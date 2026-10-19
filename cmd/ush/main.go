@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -63,6 +64,9 @@ func main() {
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "--open-uri" {
 		os.Exit(runOpenURI(os.Args[2:]))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "--guard" {
+		os.Exit(runGuard(os.Args[2:]))
 	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)
@@ -517,6 +521,18 @@ func runParent(cfg *config.Config) error {
 				paths := (&fs.GuestFS{HomeDir: hd, ExtraBinds: cfg.ExtraBindMounts}).HostBackedRWGuestPaths()
 				supervisor.SetExecStripPrefixes(paths)
 				ushlog.Info("security: exec-strip active on host-backed shares", "prefixes", len(paths))
+				guard := security.NewDeleteGuard(hd, paths)
+				guard.SetShellPid(func() int { return int(guestInitPid.Load()) })
+				sup := supervisor
+				guard.SetConfirm(func(app, where string, count int) bool {
+					bc := sup.BrokerClient()
+					if bc == nil {
+						return false
+					}
+					ok, err := bc.ConfirmDelete(app, where)
+					return err == nil && ok
+				})
+				supervisor.SetDeleteGuard(guard)
 			}
 			// User-trusted developer dirs are exempt: full host access on purpose.
 			trustedDirs := loadTrustedDevDirs(cfg.StorageDir)
@@ -558,6 +574,7 @@ func runParent(cfg *config.Config) error {
 		sessMgr.SetStopped(sess.ID)
 		return fmt.Errorf("namespace: %w", err)
 	}
+	guestInitPid.Store(int64(cmd.Process.Pid))
 
 	sessMgr.SetRunning(sess.ID)
 
@@ -741,6 +758,8 @@ func startBrokerDirect() {
 		_ = c.Process.Release()
 	}
 }
+
+var guestInitPid atomic.Int64
 
 func lanShared(storageDir string) bool {
 	eng, err := policy.NewEngine(filepath.Join(storageDir, "policy.json"))

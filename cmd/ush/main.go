@@ -54,6 +54,9 @@ import (
 )
 
 func main() {
+	if isGosh() {
+		os.Exit(runGosh())
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)
 		os.Exit(1)
@@ -926,6 +929,12 @@ func runGuestInit(cfg *config.Config) error {
 	// Start the shell.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	if isDev {
+		if err := dropAmbientCaps(); err != nil {
+			ushlog.Warn("ush: cannot clear ambient capabilities", "err", err)
+		}
+	}
 
 	sh, err := shell.New(&shell.Config{
 		PkgManager: pkgMgr,

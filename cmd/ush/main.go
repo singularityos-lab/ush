@@ -716,7 +716,7 @@ func loadTrustedDevDirs(storageDir string) []string {
 	}
 	var dirs []string
 	for _, r := range eng.List() {
-		if r.Category == policy.Category("devdir") && r.Decision == policy.DecisionAllow {
+		if policy.IsDevDirCategory(r.Category, os.Getenv("USH_PROFILE") == "dev") && r.Decision == policy.DecisionAllow {
 			dirs = append(dirs, r.Resource)
 		}
 	}

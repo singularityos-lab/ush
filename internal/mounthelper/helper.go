@@ -221,7 +221,7 @@ func (h *helper) isTrusted(path string) bool {
 		return false
 	}
 	for _, r := range eng.List() {
-		if r.Category != policy.Category("devdir") || r.Decision != policy.DecisionAllow {
+		if !policy.IsDevDirCategory(r.Category, os.Getenv("USH_PROFILE") == "dev") || r.Decision != policy.DecisionAllow {
 			continue
 		}
 		// The grant is pinned to its real (symlink-resolved) path at confirmation

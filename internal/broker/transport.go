@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/singularityos-lab/ush/internal/policy"
 )
 
 // SocketPath returns the path of the broker's private control socket. It lives
@@ -169,7 +171,7 @@ func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 	case "IsAppTrusted":
 		return rpcResponse{Trusted: s.isAppTrusted(req.App)}
 	case "TrustDir":
-		if err := s.trustDir(req.Resource); err != nil {
+		if err := s.trustDir(req.Resource, req.Category == string(policy.CategoryDevDirDev)); err != nil {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{}
@@ -178,8 +180,14 @@ func (s *Server) dispatchFrom(req rpcRequest, peer peerIdentity) rpcResponse {
 			return rpcResponse{Error: err.Error()}
 		}
 		return rpcResponse{}
+	case "SyncDevDirs":
+		n, err := s.syncDevDirs(req.Enable)
+		if err != nil {
+			return rpcResponse{Error: err.Error()}
+		}
+		return rpcResponse{OK: true, Message: strconv.Itoa(n)}
 	case "ListDevDirs":
-		return rpcResponse{Permissions: s.listDevDirs()}
+		return rpcResponse{Permissions: s.listDevDirsFor(req.Enable)}
 	case "RequestDevShell":
 		return rpcResponse{Trusted: s.requestDevShell()}
 	case "DevShellStatus":

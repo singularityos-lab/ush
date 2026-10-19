@@ -683,7 +683,7 @@ const devDirCategory policy.Category = "devdir"
 // trustDir grants a directory full host access from the guest, AFTER a host-side
 // confirmation. This is the path used by the guest shell's `perm trust-dir`,
 // where the requester is the untrusted guest and the dialog is the security gate.
-func (s *Server) trustDir(path string) error {
+func (s *Server) trustDir(path string, devOnly bool) error {
 	if path == "" {
 		return fmt.Errorf("empty path")
 	}
@@ -706,6 +706,9 @@ func (s *Server) trustDir(path string) error {
 		ushlog.Warn("broker: dir trust denied by user", "path", path)
 		return fmt.Errorf("trust not confirmed by user")
 	}
+	if devOnly {
+		return s.trustDirAs(path, policy.CategoryDevDirDev)
+	}
 	return s.trustDirConfirmed(path)
 }
 
@@ -715,6 +718,10 @@ func (s *Server) trustDir(path string) error {
 // and the guest cannot reach the session bus, so the host UI gesture IS the
 // consent. The guest socket path never calls this; it goes through trustDir.
 func (s *Server) trustDirConfirmed(path string) error {
+	return s.trustDirAs(path, devDirCategory)
+}
+
+func (s *Server) trustDirAs(path string, category policy.Category) error {
 	if path == "" {
 		return fmt.Errorf("empty path")
 	}
@@ -727,7 +734,7 @@ func (s *Server) trustDirConfirmed(path string) error {
 	}
 	path = real
 	s.mu.Lock()
-	s.policy.Set(devDirCategory, path, policy.DecisionAllow)
+	s.policy.Set(category, path, policy.DecisionAllow)
 	err = s.policy.Save()
 	s.mu.Unlock()
 	if err != nil {
@@ -814,6 +821,7 @@ func (s *Server) untrustDir(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.policy.Remove(devDirCategory, path)
+	s.policy.Remove(policy.CategoryDevDirDev, path)
 	if err := s.policy.Save(); err != nil {
 		return err
 	}
@@ -823,11 +831,15 @@ func (s *Server) untrustDir(path string) error {
 
 // listDevDirs returns the trusted developer directories as a JSON array.
 func (s *Server) listDevDirs() string {
+	return s.listDevDirsFor(false)
+}
+
+func (s *Server) listDevDirsFor(dev bool) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dirs := []string{}
 	for _, r := range s.policy.List() {
-		if r.Category == devDirCategory && r.Decision == policy.DecisionAllow {
+		if policy.IsDevDirCategory(r.Category, dev) && r.Decision == policy.DecisionAllow {
 			dirs = append(dirs, r.Resource)
 		}
 	}
@@ -1156,4 +1168,50 @@ func (a *AuditLog) Close() {
 	if a.file != nil {
 		a.file.Close()
 	}
+}
+
+func (s *Server) syncDevDirs(toDev bool) (int, error) {
+	from, to := policy.CategoryDevDirDev, devDirCategory
+	if toDev {
+		from, to = devDirCategory, policy.CategoryDevDirDev
+	}
+	s.mu.Lock()
+	have := map[string]bool{}
+	var missing []string
+	for _, r := range s.policy.List() {
+		if r.Category == to && r.Decision == policy.DecisionAllow {
+			have[r.Resource] = true
+		}
+	}
+	for _, r := range s.policy.List() {
+		if r.Category == from && r.Decision == policy.DecisionAllow && !have[r.Resource] {
+			missing = append(missing, r.Resource)
+			have[r.Resource] = true
+		}
+	}
+	s.mu.Unlock()
+	if len(missing) == 0 {
+		return 0, nil
+	}
+	target := "the Linux sandbox (ush)"
+	if toDev {
+		target = "the developer shell (dsh)"
+	}
+	lines := make([]string, len(missing))
+	for i, d := range missing {
+		lines[i] = dialogSafe(d)
+	}
+	if !s.confirmDialog(
+		"USH - Share developer directories",
+		fmt.Sprintf("Give %s FULL host access to these directories, already shared with the other environment?\n\n%s",
+			target, strings.Join(lines, "\n")),
+	) {
+		return 0, fmt.Errorf("sync not confirmed by user")
+	}
+	for _, d := range missing {
+		if err := s.trustDirAs(d, to); err != nil {
+			return 0, err
+		}
+	}
+	return len(missing), nil
 }

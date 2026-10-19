@@ -11,9 +11,11 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"os"
 	"time"
 
 	ushlog "github.com/singularityos-lab/ush/internal/log"
+	"github.com/singularityos-lab/ush/internal/policy"
 )
 
 // Decision is the broker's decision.
@@ -144,7 +146,11 @@ func (c *Client) DenyApp(appExe string) error {
 // VCS hooks run on the host). Requires host-side confirmation.
 func (c *Client) TrustDir(path string) error {
 	// Interactive: waits for host-side confirmation, so use the human-scale read.
-	resp, err := c.callTimeout(rpcRequest{Method: "TrustDir", Resource: path}, permissionReadDeadline)
+	req := rpcRequest{Method: "TrustDir", Resource: path}
+	if os.Getenv("USH_PROFILE") == "dev" {
+		req.Category = string(policy.CategoryDevDirDev)
+	}
+	resp, err := c.callTimeout(req, permissionReadDeadline)
 	if err != nil {
 		return fmt.Errorf("broker: trust dir: %w", err)
 	}
@@ -168,7 +174,7 @@ func (c *Client) UntrustDir(path string) error {
 
 // ListDevDirs returns the trusted developer directories as a JSON array string.
 func (c *Client) ListDevDirs() string {
-	resp, err := c.call(rpcRequest{Method: "ListDevDirs"})
+	resp, err := c.call(rpcRequest{Method: "ListDevDirs", Enable: os.Getenv("USH_PROFILE") == "dev"})
 	if err != nil || resp.Error != "" {
 		return "[]"
 	}
@@ -294,4 +300,17 @@ func (c *Client) OpenURI(uri string) error {
 		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
+}
+
+func (c *Client) SyncDevDirs() (int, error) {
+	resp, err := c.callTimeout(rpcRequest{Method: "SyncDevDirs", Enable: os.Getenv("USH_PROFILE") == "dev"}, permissionReadDeadline)
+	if err != nil {
+		return 0, fmt.Errorf("broker: sync dirs: %w", err)
+	}
+	if resp.Error != "" {
+		return 0, fmt.Errorf("broker: %s", resp.Error)
+	}
+	n := 0
+	fmt.Sscan(resp.Message, &n)
+	return n, nil
 }

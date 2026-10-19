@@ -708,6 +708,7 @@ func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
 		fmt.Fprintln(hc.Stderr, "       perm untrust <app>      (revoke blanket permission for app)")
 		fmt.Fprintln(hc.Stderr, "       perm trust-dir [path]   (full host access for a dev dir: build/run/git)")
 		fmt.Fprintln(hc.Stderr, "       perm untrust-dir [path] (revoke a dev dir's trust)")
+		fmt.Fprintln(hc.Stderr, "       perm sync-dirs          (share here the dev dirs trusted in the other shell)")
 		fmt.Fprintln(hc.Stderr, "       perm list-dirs          (list trusted dev dirs)")
 		fmt.Fprintln(hc.Stderr, "  categories: network, filesystem, device, service")
 		return interp.NewExitStatus(1)
@@ -788,6 +789,20 @@ func (sh *Shell) builtinPerm(ctx context.Context, args []string) error {
 			return interp.NewExitStatus(1)
 		}
 		fmt.Fprintf(hc.Stdout, "perm: %s is no longer a trusted dev dir. Restart ush to apply.\n", abs)
+		return nil
+	}
+
+	if args[0] == "sync-dirs" {
+		n, err := client.SyncDevDirs()
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "perm sync-dirs: %v\n", err)
+			return interp.NewExitStatus(1)
+		}
+		if n == 0 {
+			fmt.Fprintln(hc.Stdout, "perm: trusted dev dirs already in sync")
+			return nil
+		}
+		fmt.Fprintf(hc.Stdout, "perm: %d trusted dev dir(s) shared here too. Run 'restart' if one does not show up.\n", n)
 		return nil
 	}
 

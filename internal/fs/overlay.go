@@ -300,14 +300,30 @@ func (g *GuestFS) bindRODirs() error {
 
 	sysDst := filepath.Join(g.GuestRoot, "sys")
 
-	// dsh: bind the host /sys NON-recursively, so the host's cgroup mount is NOT
-	// pulled in (that real-root cgroup is what made a fresh mount EBUSY). Then put
-	// a FRESH cgroup2 on the now-empty /sys/fs/cgroup: with the guest cgroup
-	// namespace it is rooted at the delegated systemd scope, writable, which is
-	// what nested rootless podman needs.
+	// dsh: a tmpfs /sys carrying read-only recursive binds of the device trees,
+	// so GPU drivers find their devices. The host /sys itself cannot be bound
+	// non-recursively from a user namespace, and binding it recursively would
+	// pull in the host's cgroup mount (that real-root cgroup is what made a fresh
+	// mount EBUSY). Then put a FRESH cgroup2 on /sys/fs/cgroup: with the guest
+	// cgroup namespace it is rooted at the delegated systemd scope, writable,
+	// which is what nested rootless podman needs.
 	if g.DevProfile {
-		if err := unix.Mount("/sys", sysDst, "", unix.MS_BIND, ""); err != nil {
-			ushlog.Warn("fs: dev /sys bind failed", "err", err)
+		if err := unix.Mount("tmpfs", sysDst, "tmpfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "mode=0755"); err != nil {
+			ushlog.Warn("fs: dev /sys tmpfs failed", "err", err)
+		}
+		for _, d := range []string{"devices", "dev", "class", "bus", "block", "firmware"} {
+			src := filepath.Join("/sys", d)
+			if _, err := os.Stat(src); err != nil {
+				continue
+			}
+			dst := filepath.Join(sysDst, d)
+			if err := os.MkdirAll(dst, 0755); err != nil {
+				ushlog.Warn("fs: dev /sys mkdir failed", "path", dst, "err", err)
+				continue
+			}
+			if err := bindMount(src, dst, true); err != nil {
+				ushlog.Warn("fs: dev /sys bind failed", "path", d, "err", err)
+			}
 		}
 		cgDst := filepath.Join(sysDst, "fs", "cgroup")
 		_ = os.MkdirAll(cgDst, 0755)

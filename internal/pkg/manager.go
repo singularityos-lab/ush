@@ -982,6 +982,7 @@ func createPackageHookWrappers() (string, func(), error) {
 		"update-alternatives",
 		"update-desktop-database",
 		"update-mime-database",
+		"start-stop-daemon",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0755); err != nil {
 			cleanup()

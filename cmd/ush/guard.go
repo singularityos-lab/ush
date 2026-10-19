@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/singularityos-lab/ush/internal/broker"
+	ushlog "github.com/singularityos-lab/ush/internal/log"
 	"github.com/singularityos-lab/ush/internal/security"
 )
 
@@ -51,6 +53,7 @@ func runGuard(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: ush --guard -- PROGRAM [ARGS...]")
 		return 2
 	}
+	ushlog.Init("error", io.Discard)
 	self, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)

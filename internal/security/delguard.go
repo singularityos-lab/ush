@@ -344,7 +344,6 @@ func killTree(root int) {
 	if root <= 1 || root == os.Getpid() {
 		return
 	}
-	_ = syscall.Kill(root, syscall.SIGSTOP)
 	children := map[int][]int{}
 	if ents, err := os.ReadDir("/proc"); err == nil {
 		for _, e := range ents {

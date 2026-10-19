@@ -120,7 +120,7 @@ func (c *Client) IsAllowed(category, resource, reason string) bool {
 
 // AllowApp grants blanket permission for an application (keyed on exe path).
 func (c *Client) AllowApp(appExe string) error {
-	resp, err := c.call(rpcRequest{Method: "AllowApp", App: appExe})
+	resp, err := c.callTimeout(rpcRequest{Method: "AllowApp", App: appExe}, permissionReadDeadline)
 	if err != nil {
 		return fmt.Errorf("broker: allow app: %w", err)
 	}
@@ -231,7 +231,7 @@ func (c *Client) ListDevDirs() string {
 // RequestDevShell asks the broker (host-side dialog) to open the developer
 // environment. Returns true only on explicit user confirmation.
 func (c *Client) RequestDevShell() bool {
-	resp, err := c.call(rpcRequest{Method: "RequestDevShell"})
+	resp, err := c.callTimeout(rpcRequest{Method: "RequestDevShell"}, permissionReadDeadline)
 	if err != nil {
 		return false
 	}

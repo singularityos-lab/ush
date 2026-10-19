@@ -171,6 +171,21 @@ func (sh *Shell) RunScript(ctx context.Context, r io.Reader, name string) error 
 // redirects bare systemctl to systemctl --user, and adapts
 // Electron/Chromium apps for the user namespace.
 func (sh *Shell) execHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	run := sh.execDispatch(next)
+	return func(ctx context.Context, args []string) error {
+		err := run(ctx, args)
+		if err == nil || errors.Is(err, errShellRestart) || errors.Is(err, errInterrupted) || ctx.Err() != nil {
+			return err
+		}
+		if _, ok := interp.IsExitStatus(err); ok {
+			return err
+		}
+		fmt.Fprintf(interp.HandlerCtx(ctx).Stderr, "%s: %v\n", filepath.Base(args[0]), err)
+		return interp.NewExitStatus(1)
+	}
+}
+
+func (sh *Shell) execDispatch(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		if len(args) == 0 {
 			return next(ctx, args)

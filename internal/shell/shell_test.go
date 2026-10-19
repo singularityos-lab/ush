@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"mvdan.cc/sh/v3/expand"
+	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func TestPrompt(t *testing.T) {
@@ -186,5 +188,36 @@ func TestCompleteFilesUsesShellDir(t *testing.T) {
 func TestRuneWidth(t *testing.T) {
 	if got := visibleLen("\x1b[1;32mmirko\x1b[0m@\U0001F527DSH:"); got != 12 {
 		t.Errorf("visibleLen = %d, want 12", got)
+	}
+}
+
+func TestBuiltinErrorDoesNotEndShell(t *testing.T) {
+	sh := &Shell{}
+	var out, errOut bytes.Buffer
+	failing := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			if args[0] == "boom" {
+				return fmt.Errorf("broken install")
+			}
+			return next(ctx, args)
+		}
+	}
+	runner, err := interp.New(interp.StdIO(nil, &out, &errOut), interp.ExecHandlers(sh.execHandler, failing))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := syntax.NewParser().Parse(strings.NewReader("boom; echo after $?"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Run(context.Background(), f)
+	if runner.Exited() {
+		t.Fatal("a failing command ended the shell")
+	}
+	if !strings.Contains(out.String(), "after 1") {
+		t.Errorf("stdout = %q, want the next command to run with status 1", out.String())
+	}
+	if !strings.Contains(errOut.String(), "broken install") {
+		t.Errorf("stderr = %q, want the error message", errOut.String())
 	}
 }

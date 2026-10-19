@@ -58,6 +58,9 @@ func main() {
 	if isGosh() {
 		os.Exit(runGosh())
 	}
+	if isBwrapShim() {
+		os.Exit(runBwrapShim())
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "--open-uri" {
 		os.Exit(runOpenURI(os.Args[2:]))
 	}
@@ -954,12 +957,6 @@ func runGuestInit(cfg *config.Config) error {
 	// Start the shell.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	if isDev {
-		if err := dropAmbientCaps(); err != nil {
-			ushlog.Warn("ush: cannot clear ambient capabilities", "err", err)
-		}
-	}
 
 	sh, err := shell.New(&shell.Config{
 		PkgManager: pkgMgr,

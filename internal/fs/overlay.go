@@ -154,6 +154,9 @@ func (g *GuestFS) Setup() error {
 	}
 	g.bindAbsoluteWayland()
 	g.bindPastedFiles()
+	if g.DevProfile {
+		g.shimBwrap()
+	}
 	if err := g.blockPackageManagers(); err != nil {
 		return err
 	}
@@ -1465,6 +1468,29 @@ func (g *GuestFS) bindAbsoluteWayland() {
 	}
 	if err := bindMount(sock, dst, false); err != nil {
 		ushlog.Warn("fs: bind wayland socket failed", "socket", sock, "err", err)
+	}
+}
+
+func (g *GuestFS) shimBwrap() {
+	self, err := os.Executable()
+	if err != nil || !statExists("/usr/bin/bwrap") {
+		return
+	}
+	real := filepath.Join(g.GuestRoot, "run", "ush", "bwrap")
+	if err := os.MkdirAll(filepath.Dir(real), 0o755); err != nil {
+		return
+	}
+	if f, err := os.OpenFile(real, os.O_CREATE, 0o755); err == nil {
+		f.Close()
+	} else {
+		return
+	}
+	if err := bindMount("/usr/bin/bwrap", real, true); err != nil {
+		ushlog.Warn("fs: cannot expose the real bwrap", "err", err)
+		return
+	}
+	if err := bindMount(self, filepath.Join(g.GuestRoot, "usr", "bin", "bwrap"), true); err != nil {
+		ushlog.Warn("fs: cannot install the bwrap shim", "err", err)
 	}
 }
 

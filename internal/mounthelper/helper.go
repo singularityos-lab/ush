@@ -32,6 +32,7 @@ package mounthelper
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -312,6 +313,9 @@ func Notify(runtimeDir, path string) {
 	for _, sock := range socks {
 		conn, err := net.Dial("unix", sock)
 		if err != nil {
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				os.Remove(sock)
+			}
 			continue
 		}
 		data, _ := json.Marshal(request{Path: path})

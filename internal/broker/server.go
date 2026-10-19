@@ -825,7 +825,7 @@ func (s *Server) untrustDir(path string) error {
 func (s *Server) listDevDirs() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var dirs []string
+	dirs := []string{}
 	for _, r := range s.policy.List() {
 		if r.Category == devDirCategory && r.Decision == policy.DecisionAllow {
 			dirs = append(dirs, r.Resource)

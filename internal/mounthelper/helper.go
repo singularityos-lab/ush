@@ -155,6 +155,7 @@ func Run() error {
 
 type helper struct {
 	storageDir string
+	mounted    map[string]bool
 }
 
 func (h *helper) handleConn(conn net.Conn) {
@@ -198,7 +199,17 @@ func (h *helper) mountOne(path string) error {
 	if fi, err := os.Lstat(real); err != nil || !fi.IsDir() {
 		return fmt.Errorf("not a directory")
 	}
-	return injectMount(real, path)
+	if h.mounted[path] {
+		return nil
+	}
+	if err := injectMount(real, path); err != nil {
+		return err
+	}
+	if h.mounted == nil {
+		h.mounted = map[string]bool{}
+	}
+	h.mounted[path] = true
+	return nil
 }
 
 // isTrusted re-reads the broker policy and reports whether path is at or below a

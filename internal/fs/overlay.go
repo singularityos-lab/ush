@@ -126,6 +126,7 @@ func (g *GuestFS) Setup() error {
 	if err := g.bindHome(); err != nil {
 		return err
 	}
+	g.aliasLegacyHome()
 	if err := g.bindPkgLayer(); err != nil {
 		return err
 	}
@@ -346,6 +347,9 @@ func (g *GuestFS) setupBinBash() error {
 		ushlog.Info("fs: /bin bash overlay skipped (bash seeded into pkgroot/usr/bin, surfaced by /usr/bin overlay)")
 		return nil
 	}
+	if statExists("/usr/bin/bash") {
+		return nil
+	}
 	var bashSrc string
 	for _, p := range []string{
 		filepath.Join(g.ToolsDir, "bin", "bash"),
@@ -443,6 +447,7 @@ func (g *GuestFS) setupUsr() error {
 	g.seedDebconfBase(pkgUsr)
 	g.seedShadowTools(pkgUsr)
 	g.seedBash(pkgUsr)
+	g.unshadowImageBinaries(pkgroot, pkgUsr)
 
 	// One DEDICATED, non-aliased fuse-overlayfs per top-level /usr subdir: lower=/usr/<X>,
 	// upper=pkgroot/usr/<X>, so each pkgroot/usr/<X> is the upperdir of exactly ONE
@@ -500,6 +505,9 @@ func (g *GuestFS) seedBash(pkgUsr string) {
 	if bashSrc == "" {
 		return
 	}
+	if statExists("/usr/bin/bash") {
+		return
+	}
 	dst := filepath.Join(pkgUsr, "bin", "bash")
 	if _, err := os.Stat(dst); err == nil {
 		return // already seeded (pkgroot persists)
@@ -513,6 +521,33 @@ func (g *GuestFS) seedBash(pkgUsr string) {
 	}
 	if err := os.WriteFile(dst, data, 0o755); err == nil {
 		ushlog.Info("fs: seeded bash into pkgroot (/usr/bin/bash, reached at /bin/bash via symlink)")
+	}
+}
+
+func (g *GuestFS) unshadowImageBinaries(pkgroot, pkgUsr string) {
+	for _, sub := range []string{"bin", "sbin"} {
+		entries, err := os.ReadDir(filepath.Join(pkgUsr, sub))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, "perl") || strings.HasPrefix(name, "debconf") {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join("/usr", sub, name)); err != nil {
+				continue
+			}
+			aside := filepath.Join(pkgroot, ".shadowed", "usr", sub)
+			if err := os.MkdirAll(aside, 0o755); err != nil {
+				return
+			}
+			if err := os.Rename(filepath.Join(pkgUsr, sub, name), filepath.Join(aside, name)); err != nil {
+				ushlog.Warn("fs: cannot move aside a package file that shadows the image", "file", filepath.Join("/usr", sub, name), "err", err)
+				continue
+			}
+			ushlog.Info("fs: package file shadowed the image, moved aside", "file", filepath.Join("/usr", sub, name), "aside", aside)
+		}
 	}
 }
 
@@ -1390,6 +1425,22 @@ func (g *GuestFS) bindHome() error {
 	ushlog.Info("fs: isolated guest home; real data dirs write-isolated (overlay), trust-dir for full access",
 		"home", g.HomeDir)
 	return nil
+}
+
+func (g *GuestFS) aliasLegacyHome() {
+	if !strings.HasPrefix(g.HomeDir, "/var/home/") {
+		return
+	}
+	link := filepath.Join(g.GuestRoot, "home", filepath.Base(g.HomeDir))
+	if _, err := os.Lstat(link); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		return
+	}
+	if err := os.Symlink(g.HomeDir, link); err != nil {
+		ushlog.Warn("fs: cannot alias the legacy home path", "link", link, "err", err)
+	}
 }
 
 // isTrustedDevDir reports whether host path p is at or below a user-trusted

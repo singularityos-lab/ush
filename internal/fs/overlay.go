@@ -152,6 +152,8 @@ func (g *GuestFS) Setup() error {
 	if err := g.bindXDGRuntime(); err != nil {
 		return err
 	}
+	g.bindAbsoluteWayland()
+	g.bindPastedFiles()
 	if err := g.blockPackageManagers(); err != nil {
 		return err
 	}
@@ -1440,6 +1442,43 @@ func (g *GuestFS) aliasLegacyHome() {
 	}
 	if err := os.Symlink(g.HomeDir, link); err != nil {
 		ushlog.Warn("fs: cannot alias the legacy home path", "link", link, "err", err)
+	}
+}
+
+func (g *GuestFS) bindAbsoluteWayland() {
+	sock := os.Getenv("WAYLAND_DISPLAY")
+	if !filepath.IsAbs(sock) {
+		return
+	}
+	fi, err := os.Stat(sock)
+	if err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return
+	}
+	dst := filepath.Join(g.GuestRoot, sock)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return
+	}
+	if f, err := os.OpenFile(dst, os.O_CREATE, 0o600); err == nil {
+		f.Close()
+	} else {
+		return
+	}
+	if err := bindMount(sock, dst, false); err != nil {
+		ushlog.Warn("fs: bind wayland socket failed", "socket", sock, "err", err)
+	}
+}
+
+func (g *GuestFS) bindPastedFiles() {
+	src := filepath.Join(os.TempDir(), "leafs-pasted")
+	if err := os.MkdirAll(src, 0o700); err != nil {
+		return
+	}
+	dst := filepath.Join(g.GuestRoot, src)
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		return
+	}
+	if err := bindMount(src, dst, false); err != nil {
+		ushlog.Warn("fs: bind pasted files failed", "dir", src, "err", err)
 	}
 }
 

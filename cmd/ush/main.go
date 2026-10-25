@@ -22,6 +22,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -68,7 +69,14 @@ func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--guard" {
 		os.Exit(runGuard(os.Args[2:]))
 	}
+	if len(os.Args) == 3 && os.Args[1] == guestShellArg {
+		os.Exit(runGuestShellMain(os.Args[2]))
+	}
 	if err := run(); err != nil {
+		var ge guestExit
+		if errors.As(err, &ge) {
+			os.Exit(int(ge))
+		}
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)
 		os.Exit(1)
 	}
@@ -172,7 +180,7 @@ func run() error {
 
 	// Child process: already inside namespaces, set up and launch guest.
 	if ns.IsChildProcess() {
-		return runGuestInit(cfg)
+		return runGuestInit(cfg, logLevel)
 	}
 
 	// Gate the developer shell. It must be permitted by the image/managed policy
@@ -784,7 +792,7 @@ func loadTrustedDevDirs(storageDir string) []string {
 }
 
 // runGuestInit is the guest bootstrap (called in the child process inside the namespaces).
-func runGuestInit(cfg *config.Config) error {
+func runGuestInit(cfg *config.Config, logLevel string) error {
 	sessionID := os.Getenv("USH_SESSION_ID")
 	storageDir := os.Getenv("USH_STORAGE_DIR")
 	if storageDir == "" {
@@ -953,12 +961,23 @@ func runGuestInit(cfg *config.Config) error {
 		defer sdMgr.Stop()
 	}
 
-	persistent, err := layerMgr.EnsurePersistent()
-	if err != nil {
+	if _, err := layerMgr.EnsurePersistent(); err != nil {
 		ushlog.Warn("ush: persistent layer not available", "err", err)
 	}
-	_ = persistent
 
+	os.Setenv("USH_STORAGE_DIR", storageDir)
+	if homeDir != "" {
+		os.Setenv("HOME", homeDir)
+	}
+	os.Setenv("USH_SESSION_ID", sessionID)
+	if os.Getpid() == 1 {
+		return superviseGuestShell(logLevel)
+	}
+	return runGuestShell(storageDir, sessionID, homeDir)
+}
+
+func runGuestShell(storageDir, sessionID, homeDir string) error {
+	layerMgr := fs.NewLayerManager(storageDir)
 	pkgPrefix := layerMgr.PkgRootDir()
 	pkgMgr := pkg.New(layerMgr, sessionID, pkgPrefix)
 

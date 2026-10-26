@@ -813,7 +813,6 @@ func runGuestInit(cfg *config.Config, logLevel string) error {
 	}
 
 	// Configure the guest filesystem.
-	layerMgr := fs.NewLayerManager(storageDir)
 	homeDir, _ := os.UserHomeDir()
 	if homeDir != "" {
 		os.Setenv("HOME", homeDir)
@@ -888,6 +887,20 @@ func runGuestInit(cfg *config.Config, logLevel string) error {
 		ushlog.Info("ush: LD_PRELOAD shim active", "path", shimPath)
 	}
 
+	os.Setenv("USH_STORAGE_DIR", storageDir)
+	if homeDir != "" {
+		os.Setenv("HOME", homeDir)
+	}
+	os.Setenv("USH_SESSION_ID", sessionID)
+	if os.Getpid() == 1 {
+		return superviseGuestShell(logLevel)
+	}
+	defer applyGuestLayers(cfg, homeDir, xdgRuntime, storageDir)()
+	return runGuestShell(storageDir, sessionID, homeDir)
+}
+
+func applyGuestLayers(cfg *config.Config, homeDir, xdgRuntime, storageDir string) func() {
+	stop := func() {}
 	isDev := os.Getenv("USH_PROFILE") == "dev"
 
 	// Apply security layers - after pivot_root so paths refer to guest rootfs.
@@ -958,22 +971,14 @@ func runGuestInit(cfg *config.Config, logLevel string) error {
 			os.Setenv("XDG_RUNTIME_DIR", xdgRuntime)
 			os.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path="+filepath.Join(xdgRuntime, "bus"))
 		}
-		defer sdMgr.Stop()
+		stop = sdMgr.Stop
 	}
 
-	if _, err := layerMgr.EnsurePersistent(); err != nil {
+	if _, err := fs.NewLayerManager(storageDir).EnsurePersistent(); err != nil {
 		ushlog.Warn("ush: persistent layer not available", "err", err)
 	}
 
-	os.Setenv("USH_STORAGE_DIR", storageDir)
-	if homeDir != "" {
-		os.Setenv("HOME", homeDir)
-	}
-	os.Setenv("USH_SESSION_ID", sessionID)
-	if os.Getpid() == 1 {
-		return superviseGuestShell(logLevel)
-	}
-	return runGuestShell(storageDir, sessionID, homeDir)
+	return stop
 }
 
 func runGuestShell(storageDir, sessionID, homeDir string) error {

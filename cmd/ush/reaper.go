@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/singularityos-lab/ush/internal/config"
 	ushlog "github.com/singularityos-lab/ush/internal/log"
 )
 
@@ -94,7 +95,14 @@ func runGuestShellMain(logLevel string) int {
 		os.Unsetenv(envGuestPreload)
 		os.Setenv("LD_PRELOAD", v)
 	}
-	if err := runGuestShell(os.Getenv("USH_STORAGE_DIR"), os.Getenv("USH_SESSION_ID"), os.Getenv("HOME")); err != nil {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ush: config: %v\n", err)
+		return 1
+	}
+	storageDir := os.Getenv("USH_STORAGE_DIR")
+	defer applyGuestLayers(cfg, os.Getenv("HOME"), hostRuntimeDir(), storageDir)()
+	if err := runGuestShell(storageDir, os.Getenv("USH_SESSION_ID"), os.Getenv("HOME")); err != nil {
 		fmt.Fprintf(os.Stderr, "ush: %v\n", err)
 		return 1
 	}

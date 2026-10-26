@@ -62,7 +62,7 @@ func Defaults() *Config {
 	return &Config{
 		StorageDir:         defaultStorageDir(),
 		FallbackShell:      "/bin/bash",
-		BrokerBusName:      "io.github.singularityos_lab.ush.Broker",
+		BrokerBusName:      "dev.sinty.ush.Broker",
 		NetworkBackend:     "pasta",
 		OverlayBackend:     "kernel",
 		EnablePIDNamespace: true,

@@ -39,9 +39,9 @@ const (
 	// PortalBusName et al. are the OPTIONAL desktop-portal interface the broker
 	// (a host process) may call to render a native permission dialog. This is a
 	// host-to-host D-Bus call inside showDialog; the guest never touches it.
-	PortalBusName   = "io.github.singularityos_lab.ush.Portal"
-	PortalObjPath   = "/io/github/singularityos_lab/ush/Portal"
-	PortalInterface = "io.github.singularityos_lab.ush.Portal1"
+	PortalBusName   = "dev.sinty.ush.Portal"
+	PortalObjPath   = "/dev/sinty/ush/Portal"
+	PortalInterface = "dev.sinty.ush.Portal1"
 
 	// BusName et al. are the HOST-ONLY management interface, exposed on the
 	// session bus for trusted desktop components (the portal/shell) to trust or
@@ -49,9 +49,9 @@ const (
 	// socket; only these three management calls live on D-Bus. This is safe
 	// because the guest no longer has the host session bus (its runtime dir is
 	// isolated), so only host processes can reach it.
-	BusName   = "io.github.singularityos_lab.ush.Broker"
-	ObjPath   = "/io/github/singularityos_lab/ush/Broker"
-	Interface = "io.github.singularityos_lab.ush.Broker1"
+	BusName   = "dev.sinty.ush.Broker"
+	ObjPath   = "/dev/sinty/ush/Broker"
+	Interface = "dev.sinty.ush.Broker1"
 )
 
 // dbusManager exposes the host-only management subset (AllowApp/DenyApp/
@@ -227,7 +227,7 @@ func (s *Server) StartManagementBus() {
 
 var managementIntrospectXML = `
 <node>
-  <interface name="io.github.singularityos_lab.ush.Broker1">
+  <interface name="dev.sinty.ush.Broker1">
     <method name="AllowApp"><arg name="appExe" type="s" direction="in"/></method>
     <method name="DenyApp"><arg name="appExe" type="s" direction="in"/></method>
     <method name="IsAppTrusted">
@@ -1014,7 +1014,7 @@ func (s *Server) portalAvailable(conn *dbus.Conn) bool {
 }
 
 // portalConfirm asks the desktop portal to render a yes/no confirmation via
-// io.github.singularityos_lab.ush.Portal1.ShowConfirm. served is false when the portal
+// dev.sinty.ush.Portal1.ShowConfirm. served is false when the portal
 // is unavailable, so the caller falls back to zenity/kdialog/terminal.
 func (s *Server) portalConfirm(title, body string) (result bool, served bool) {
 	conn, err := dbus.ConnectSessionBus()
@@ -1037,7 +1037,7 @@ func (s *Server) portalConfirm(title, body string) (result bool, served bool) {
 }
 
 // portalDialog calls the ush Portal D-Bus interface.
-// A DE that implements io.github.singularityos_lab.ush.Portal1 can show
+// A DE that implements dev.sinty.ush.Portal1 can show
 // a native permission dialog. Returns empty string if the portal
 // is unavailable or the call fails (fallback path).
 func (s *Server) portalDialog(category, resource, reason string) string {

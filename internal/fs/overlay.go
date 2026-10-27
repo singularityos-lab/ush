@@ -1844,6 +1844,22 @@ func (g *GuestFS) bindDevices() error {
 		binds = append(binds, deviceBind{"/dev/dri", filepath.Join(dev, "dri"), false})
 	}
 
+	// Developer (dsh) profile: USB devices for phone and board tooling (adb,
+	// usbmuxd, flashers). Binding the directory keeps hotplugged devices visible.
+	if g.DevProfile {
+		if _, err := os.Stat("/dev/bus/usb"); err == nil {
+			usbDst := filepath.Join(dev, "bus/usb")
+			os.MkdirAll(usbDst, 0755)
+			binds = append(binds, deviceBind{"/dev/bus/usb", usbDst, false})
+		}
+		for _, pattern := range []string{"/dev/ttyUSB*", "/dev/ttyACM*"} {
+			nodes, _ := filepath.Glob(pattern)
+			for _, node := range nodes {
+				binds = append(binds, deviceBind{node, filepath.Join(dev, filepath.Base(node)), false})
+			}
+		}
+	}
+
 	// Audio: bind /dev/snd if present.
 	if _, err := os.Stat("/dev/snd"); err == nil {
 		sndDst := filepath.Join(dev, "snd")

@@ -1013,6 +1013,8 @@ func runGuestShell(storageDir, sessionID, homeDir string) error {
 		os.Setenv("USH_PKG_PREFIX", pkgPrefix)
 	}
 
+	pkg.ApplyEnvironments()
+
 	// Start the shell.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

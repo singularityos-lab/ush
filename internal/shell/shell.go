@@ -527,6 +527,8 @@ func (sh *Shell) builtinPkg(ctx context.Context, args []string) error {
 		return sh.pkgMgr.List(ctx, hc.Stdout)
 	case "compat":
 		return sh.pkgCompat(ctx, hc, args[1:])
+	case "env":
+		return sh.pkgMgr.Env(ctx, hc.Stdin, hc.Stdout, hc.Stderr, args[1:])
 	case "help", "--help", "-h":
 		printPkgUsage(hc.Stdout)
 		return nil
@@ -943,6 +945,7 @@ USAGE:
   pkg freeze                              promote ephemeral layer to persistent
   pkg list                                list installed packages
   pkg compat [<package>]                  check package compatibility with USH
+  pkg env [list|add|remove] [<name>]      install a development environment (android, ios) on demand
 `)
 }
 
@@ -959,7 +962,7 @@ func completeBuiltinCmds(prefix string) []string {
 
 // completePkgSubcommands completes pkg subcommands.
 func completePkgSubcommands(prefix string) []string {
-	subcmds := []string{"install", "update", "remove", "fix", "burn", "diff", "inspect", "freeze", "list", "compat", "help"}
+	subcmds := []string{"install", "update", "remove", "fix", "burn", "diff", "inspect", "freeze", "list", "compat", "env", "help"}
 	var matches []string
 	for _, s := range subcmds {
 		if strings.HasPrefix(s, prefix) {

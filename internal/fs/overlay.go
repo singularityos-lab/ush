@@ -1434,6 +1434,16 @@ func (g *GuestFS) bindHome() error {
 			continue // bound raw read-write by bindTrustedDevDirs
 		}
 		dstSub := filepath.Join(dst, sub)
+		if g.isSharedDataDir(sub) {
+			g.migrateIsolatedWrites(src, dstSub)
+			if err := bindMount(src, dstSub, false); err != nil {
+				ushlog.Warn("fs: shared data dir bind failed, falling back to read-only", "dir", sub, "err", err)
+				if e2 := bindMount(src, dstSub, true); e2 != nil {
+					ushlog.Warn("fs: shared data dir read-only fallback failed", "dir", sub, "err", e2)
+				}
+			}
+			continue
+		}
 		if err := g.overlayExpose(src, dstSub); err != nil {
 			// Fail safe: read-only, NEVER raw read-write.
 			ushlog.Warn("fs: share overlay failed, falling back to read-only", "dir", sub, "err", err)
@@ -1570,14 +1580,18 @@ func (g *GuestFS) bindTrustedDevDirs() error {
 // host file the host could later run. The supervisor strips the executable bit
 // from anything the guest makes executable under them.
 //
-// With the home data dirs write-isolated by default (overlay), the only raw
-// host read-write surface left is an explicit `:rw` extra bind. The shared data
-// dirs are overlays (writes diverge into a guest-private layer, so they cannot
+// The raw host read-write surface is the developer shell's sharedDataDirs plus
+// any explicit `:rw` extra bind. The other shared home dirs are overlays (writes diverge into a guest-private layer, so they cannot
 // produce a host-runnable file and need no stripping), and trusted dev dirs are
 // full-access on purpose (exempt). The guest's own private areas are likewise
 // never listed.
 func (g *GuestFS) HostBackedRWGuestPaths() []string {
 	var out []string
+	if g.DevProfile && g.HomeDir != "" {
+		for _, sub := range sharedDataDirs {
+			out = append(out, filepath.Join(g.HomeDir, sub))
+		}
+	}
 	for _, spec := range g.ExtraBinds {
 		parts := strings.Split(strings.TrimSpace(spec), ":")
 		if len(parts) >= 3 && parts[2] == "rw" && parts[1] != "" {
@@ -1732,12 +1746,78 @@ func (g *GuestFS) applyExtraBinds() error {
 // The upper/work layers live under the persistent layer so the guest's own state
 // (sessions, history) survives across runs; anything malicious it writes there
 // stays guest-private and only ever runs inside the guest.
+// sharedDataDirs are the personal data dirs the developer shell writes straight
+// to the host: what a tool saves to ~/Downloads or ~/Documents is meant for the
+// user's file manager, not for a guest-private layer nobody looks at. They hold
+// documents, not auto-executed config, and HostBackedRWGuestPaths lists them so
+// the supervisor strips any executable bit the guest sets there.
+var sharedDataDirs = []string{"Documents", "Downloads", "Music", "Pictures", "Videos"}
+
+func (g *GuestFS) isSharedDataDir(sub string) bool {
+	if !g.DevProfile {
+		return false
+	}
+	for _, d := range sharedDataDirs {
+		if d == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *GuestFS) overlayBase(dst string) string {
+	key := strings.Trim(strings.ReplaceAll(strings.TrimPrefix(dst, g.GuestRoot), "/", "_"), "_")
+	return filepath.Join(g.LayerDir, "persistent", "overlay", key)
+}
+
+// migrateIsolatedWrites moves files a previous session wrote into the old
+// write-isolated layer of a shared data dir onto the host dir, so nothing saved
+// before the switch is lost. A name that already exists on the host stays in
+// the layer; whiteouts are dropped, never replayed as host deletions.
+func (g *GuestFS) migrateIsolatedWrites(host, dst string) {
+	upper := filepath.Join(g.overlayBase(dst), "upper")
+	if _, err := os.Stat(upper); err != nil {
+		return
+	}
+	moved := 0
+	filepath.Walk(upper, func(p string, info os.FileInfo, err error) error { //nolint:errcheck
+		if err != nil || p == upper {
+			return nil
+		}
+		rel, _ := filepath.Rel(upper, p)
+		target := filepath.Join(host, rel)
+		if info.Mode()&os.ModeCharDevice != 0 {
+			return nil
+		}
+		if info.IsDir() {
+			if _, err := os.Lstat(target); os.IsNotExist(err) {
+				os.MkdirAll(target, info.Mode().Perm()) //nolint:errcheck
+			}
+			return nil
+		}
+		if _, err := os.Lstat(target); err == nil {
+			return nil
+		}
+		if err := os.Rename(p, target); err != nil {
+			ushlog.Warn("fs: cannot move an isolated write to the host", "file", target, "err", err)
+			return nil
+		}
+		if info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			os.Chmod(target, info.Mode().Perm()&^0o111) //nolint:errcheck
+		}
+		moved++
+		return nil
+	})
+	if moved > 0 {
+		ushlog.Info("fs: moved isolated writes to the host data dir", "dir", host, "files", moved)
+	}
+}
+
 func (g *GuestFS) overlayExpose(lower, dst string) error {
 	if err := os.MkdirAll(dst, 0755); err != nil {
 		return err
 	}
-	key := strings.Trim(strings.ReplaceAll(strings.TrimPrefix(dst, g.GuestRoot), "/", "_"), "_")
-	base := filepath.Join(g.LayerDir, "persistent", "overlay", key)
+	base := g.overlayBase(dst)
 	upper := filepath.Join(base, "upper")
 	work := filepath.Join(base, "work")
 	if err := os.MkdirAll(upper, 0755); err != nil {

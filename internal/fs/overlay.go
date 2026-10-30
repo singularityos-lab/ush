@@ -1924,6 +1924,13 @@ func (g *GuestFS) bindDevices() error {
 		binds = append(binds, deviceBind{"/dev/dri", filepath.Join(dev, "dri"), false})
 	}
 
+	// Developer (dsh) profile: hardware virtualization for QEMU and emulators.
+	if g.DevProfile {
+		if _, err := os.Stat("/dev/kvm"); err == nil {
+			binds = append(binds, deviceBind{"/dev/kvm", filepath.Join(dev, "kvm"), false})
+		}
+	}
+
 	// Developer (dsh) profile: USB devices for phone and board tooling (adb,
 	// usbmuxd, flashers). Binding the directory keeps hotplugged devices visible.
 	if g.DevProfile {

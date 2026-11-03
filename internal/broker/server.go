@@ -179,6 +179,18 @@ func (d *dbusManager) SetSdbEnabled(enabled bool) (bool, bool, string, *dbus.Err
 	return ok, active, message, nil
 }
 
+// SixStatus and SetSixEnabled back the developer switch for the experimental
+// kernel. See six.go.
+func (d *dbusManager) SixStatus() (bool, string, *dbus.Error) {
+	available, state := d.s.sixStatus()
+	return available, state, nil
+}
+
+func (d *dbusManager) SetSixEnabled(enabled bool) (bool, string, string, *dbus.Error) {
+	ok, state, message := d.s.setSixEnabled(enabled, Origin{}, sessionBusPeer())
+	return ok, state, message, nil
+}
+
 func (d *dbusManager) Reboot() *dbus.Error {
 	if err := atomSessionPower("session-reboot"); err != nil {
 		return dbus.MakeFailedError(err)
@@ -272,6 +284,16 @@ var managementIntrospectXML = `
       <arg name="enabled" type="b" direction="in"/>
       <arg name="ok" type="b" direction="out"/>
       <arg name="active" type="b" direction="out"/>
+      <arg name="message" type="s" direction="out"/>
+    </method>
+    <method name="SixStatus">
+      <arg name="available" type="b" direction="out"/>
+      <arg name="state" type="s" direction="out"/>
+    </method>
+    <method name="SetSixEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+      <arg name="ok" type="b" direction="out"/>
+      <arg name="state" type="s" direction="out"/>
       <arg name="message" type="s" direction="out"/>
     </method>
     <method name="Reboot"/>

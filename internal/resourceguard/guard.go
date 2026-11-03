@@ -247,7 +247,11 @@ func cgroupOf(pid int) string {
 	return ""
 }
 
-// cgroupMemCurrent reads memory.current (bytes) from a cgroup directory.
+// cgroupMemCurrent returns the memory of a cgroup that the kernel cannot
+// simply drop: memory.current minus the file cache it charges to the group.
+// A build or a large copy fills the cache, which the kernel reclaims on its
+// own, so counting it would warn and finally kill a healthy tree. shmem is
+// part of "file" but has no backing store without swap, so it stays counted.
 func cgroupMemCurrent(dir string) (int64, bool) {
 	b, err := os.ReadFile(filepath.Join(dir, "memory.current"))
 	if err != nil {
@@ -257,7 +261,41 @@ func cgroupMemCurrent(dir string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return v, true
+	file, shmem, ok := cgroupFileCache(dir)
+	if !ok {
+		return v, true
+	}
+	used := v - file + shmem
+	if used < 0 {
+		used = 0
+	}
+	return used, true
+}
+
+// cgroupFileCache reads the "file" and "shmem" byte counts from memory.stat.
+func cgroupFileCache(dir string) (file, shmem int64, ok bool) {
+	data, err := os.ReadFile(filepath.Join(dir, "memory.stat"))
+	if err != nil {
+		return 0, 0, false
+	}
+	var haveFile bool
+	for _, line := range strings.Split(string(data), "\n") {
+		key, val, found := strings.Cut(line, " ")
+		if !found {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "file":
+			file, haveFile = n, true
+		case "shmem":
+			shmem = n
+		}
+	}
+	return file, shmem, haveFile
 }
 
 // cgroupCPUUsec reads the cumulative usage_usec from a cgroup's cpu.stat.

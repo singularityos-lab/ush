@@ -4,6 +4,7 @@ package resourceguard
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -58,5 +59,29 @@ func TestTotalCPUTime(t *testing.T) {
 	tick := totalCPUTime(1)
 	if tick < 0 {
 		t.Errorf("totalCPUTime(1) = %v, want >= 0", tick)
+	}
+}
+
+func TestCgroupMemCurrentIgnoresFileCache(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("memory.current", "25624645632\n")
+	write("memory.stat", "anon 4080709632\nfile 21092556800\nkernel 452354048\nshmem 1470464\n")
+	got, ok := cgroupMemCurrent(dir)
+	if !ok {
+		t.Fatal("cgroupMemCurrent failed")
+	}
+	if want := int64(25624645632 - 21092556800 + 1470464); got != want {
+		t.Errorf("cgroupMemCurrent = %d, want %d", got, want)
+	}
+
+	write("memory.stat", "anon 1\n")
+	got, _ = cgroupMemCurrent(dir)
+	if got != 25624645632 {
+		t.Errorf("without a file line cgroupMemCurrent = %d, want memory.current", got)
 	}
 }

@@ -578,6 +578,12 @@ func runParent(cfg *config.Config) error {
 
 	// Reexec in the namespace.
 	cmd, err := ns.Reexec(nsCfg)
+	if err != nil && sixConfined(err) {
+		sessMgr.SetRunning(sess.ID)
+		err = runSIXConfined(sess.ID, cfg.StorageDir)
+		sessMgr.SetStopped(sess.ID)
+		return err
+	}
 	if err != nil {
 		sessMgr.SetStopped(sess.ID)
 		return fmt.Errorf("namespace: %w", err)

@@ -44,7 +44,7 @@ static void ensure_parent_dirs(const char *path) {
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-        syscall(SYS_mkdir, tmp, 0755);
+        syscall(SYS_mkdirat, AT_FDCWD, tmp, 0755);
         *p = '/';
     }
 }

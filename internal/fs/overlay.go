@@ -1947,6 +1947,13 @@ func (g *GuestFS) bindDevices() error {
 		}
 	}
 
+	if _, err := os.Stat("/dev/ntsync"); err == nil {
+		ntsyncDst := filepath.Join(dev, "ntsync")
+		if touch(ntsyncDst) {
+			binds = append(binds, deviceBind{"/dev/ntsync", ntsyncDst, false})
+		}
+	}
+
 	// Audio: bind /dev/snd if present.
 	if _, err := os.Stat("/dev/snd"); err == nil {
 		sndDst := filepath.Join(dev, "snd")

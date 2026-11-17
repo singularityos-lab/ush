@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -117,6 +118,7 @@ func (sh *Shell) RunInteractive(ctx context.Context) error {
 
 	for {
 		sh.jobs.report(sh.stderr)
+		sh.reportCwd()
 		line, err := rl.Readline(sh.prompt())
 		if err != nil {
 			if err == io.EOF {
@@ -389,6 +391,19 @@ func (sh *Shell) cwd() string {
 		return sh.runner.Dir
 	}
 	return ""
+}
+
+func (sh *Shell) reportCwd() {
+	cwd := sh.cwd()
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if cwd == "" || sh.stdout == nil {
+		return
+	}
+	host, _ := os.Hostname()
+	u := url.URL{Scheme: "file", Host: host, Path: cwd}
+	fmt.Fprintf(sh.stdout, "\033]7;%s\033\\", u.String())
 }
 
 // prompt builds the shell prompt.

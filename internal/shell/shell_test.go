@@ -30,6 +30,27 @@ func TestPrompt(t *testing.T) {
 	}
 }
 
+func TestReportCwd(t *testing.T) {
+	var buf bytes.Buffer
+	dir := filepath.Join(t.TempDir(), "My Invoices")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r, err := interp.New(interp.Dir(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := &Shell{stdout: &buf, runner: r}
+	sh.reportCwd()
+	out := buf.String()
+	if !strings.HasPrefix(out, "\033]7;file://") || !strings.HasSuffix(out, "\033\\") {
+		t.Fatalf("not an OSC 7 sequence: %q", out)
+	}
+	if !strings.Contains(out, "/My%20Invoices") {
+		t.Fatalf("path not escaped: %q", out)
+	}
+}
+
 func TestLastWord(t *testing.T) {
 	tests := []struct {
 		input string

@@ -3,8 +3,35 @@
 package security
 
 import (
+	"os"
+	"os/exec"
 	"testing"
 )
+
+func TestLandlockProcWriteDenied(t *testing.T) {
+	if os.Getenv("USH_TEST_LANDLOCK_PROC") == "1" {
+		if err := ApplyLandlock(LandlockConfig{ROPaths: []string{"/"}}); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile("/proc/self/uid_map", os.O_WRONLY, 0)
+		if err == nil {
+			f.Close()
+			t.Fatal("Landlock permitted a write outside the writable paths")
+		}
+		if !os.IsPermission(err) {
+			t.Fatal(err)
+		}
+		return
+	}
+	if _, ok := LandlockStatus(); !ok {
+		t.Skip("Landlock unavailable")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLandlockProcWriteDenied$")
+	cmd.Env = append(os.Environ(), "USH_TEST_LANDLOCK_PROC=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, output)
+	}
+}
 
 func TestAbiHandledFS(t *testing.T) {
 	tests := []struct {

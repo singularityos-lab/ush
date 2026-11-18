@@ -56,7 +56,7 @@ const fullAccess = landlockAccessFSV4
 type RulesetAttr struct {
 	HandledAccessFS  uint64
 	HandledAccessNet uint64 // ABI v4+
-	Scoped           uint32 // ABI v5+
+	Scoped           uint64 // ABI v6+
 }
 
 // PathBeneathAttr matches struct landlock_path_beneath_attr.

@@ -56,7 +56,7 @@ type seccompNotifResp struct {
 	Flags uint32
 }
 
-// IOCTL numbers for amd64.
+// IOCTL numbers (generic ioctl encoding, the same on amd64 and arm64).
 // SECCOMP_IOCTL_NOTIF_RECV = _IOWR('!', 0, 80-byte struct) = 0xC0502100
 // SECCOMP_IOCTL_NOTIF_SEND = _IOWR('!', 1, 24-byte struct) = 0xC0182101
 const (
@@ -119,11 +119,6 @@ func (s *Supervisor) injectFd(id uint64, srcfd, newfd int) error {
 	return nil
 }
 
-const (
-	sysPidfdOpen  = 434
-	sysPidfdGetfd = 438
-)
-
 // tgidOf returns the thread-group leader pid for a thread tid, read from
 // /proc/<tid>/status. Falls back to the tid itself if it cannot be read.
 func tgidOf(tid uint32) int {
@@ -155,7 +150,7 @@ func (s *Supervisor) connectViaPidfd(n *seccompNotif, family uint16, ip net.IP, 
 	// what the notification carries when a worker thread makes the syscall, e.g.
 	// curl's resolver). Threads share the fd table, so the tgid's pidfd reaches
 	// the same fd.
-	pidfd, _, errno := unix.Syscall(sysPidfdOpen, uintptr(tgidOf(n.PID)), 0, 0)
+	pidfd, _, errno := unix.Syscall(unix.SYS_PIDFD_OPEN, uintptr(tgidOf(n.PID)), 0, 0)
 	if errno != 0 {
 		ushlog.Warn("security: builtin-net pidfd_open failed", "pid", n.PID, "errno", errno)
 		return deny
@@ -163,7 +158,7 @@ func (s *Supervisor) connectViaPidfd(n *seccompNotif, family uint16, ip net.IP, 
 	defer unix.Close(int(pidfd))
 
 	guestFd := int(int32(n.Data.Args[0]))
-	hostFd, _, errno := unix.Syscall(sysPidfdGetfd, pidfd, uintptr(guestFd), 0)
+	hostFd, _, errno := unix.Syscall(unix.SYS_PIDFD_GETFD, pidfd, uintptr(guestFd), 0)
 	if errno != 0 {
 		ushlog.Warn("security: builtin-net pidfd_getfd failed", "pid", n.PID, "guestfd", guestFd, "errno", errno)
 		return deny
@@ -421,41 +416,23 @@ func (s *Supervisor) close() {
 // handleNotif dispatches a notification. The bool is true when the handler has
 // already responded to the notification itself (ADDFD_SEND path).
 func (s *Supervisor) handleNotif(n *seccompNotif) (seccompNotifResp, bool) {
-	const (
-		sysExecve    = 59
-		sysExecveat  = 322
-		sysSocket    = 41
-		sysConnect   = 42
-		sysOpenat    = 257
-		sysMount     = 165
-		sysChmod     = 90
-		sysFchmod    = 91
-		sysFchmodat  = 268
-		sysFchmodat2 = 452
-		sysUnlink    = 87
-		sysRmdir     = 84
-		sysUnlinkat  = 263
-		sysRename    = 82
-		sysRenameat  = 264
-		sysRenameat2 = 316
-	)
-	switch n.Data.Nr {
-	case sysUnlink, sysRmdir, sysUnlinkat, sysRename, sysRenameat, sysRenameat2:
+	switch kindOf(n.Data.Nr) {
+	case callUnlink, callUnlinkat, callRename, callRenameat:
 		return s.handleDelete(n), false
-	case sysExecve, sysExecveat:
+	case callExec:
 		return s.handleExecve(n), false
-	case sysSocket:
+	case callSocket:
 		if r, done := s.builtinSocket(n); done {
 			return r, true
 		}
 		return s.handleSocket(n), false
-	case sysConnect:
+	case callConnect:
 		return s.handleConnect(n), false
-	case sysOpenat:
+	case callOpen, callOpenat, callOpenat2, callCreat:
 		return s.handleOpenat(n), false
-	case sysMount:
+	case callMount:
 		return s.handleMount(n), false
-	case sysChmod, sysFchmod, sysFchmodat, sysFchmodat2:
+	case callChmod, callFchmod, callFchmodat:
 		return s.handleChmod(n), false
 	}
 	return seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}, false
@@ -775,12 +752,8 @@ func (s *Supervisor) handleOpenat(n *seccompNotif) seccompNotifResp {
 	allow := seccompNotifResp{ID: n.ID, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE}
 	deny := seccompNotifResp{ID: n.ID, Error: -int32(syscall.EPERM)}
 
-	// arg1 = pathname pointer (arg0 = dirfd)
-	pathPtr := uintptr(n.Data.Args[1])
-	flags := int(n.Data.Args[2])
-
-	path, err := readStringFromProcess(int(n.PID), pathPtr)
-	if err != nil {
+	path, flags, ok := openTarget(n)
+	if !ok {
 		return allow // fail open
 	}
 
@@ -981,21 +954,16 @@ func (s *Supervisor) handleChmod(n *seccompNotif) seccompNotifResp {
 		return cont // feature disabled
 	}
 
-	const (
-		sysChmod    = 90
-		sysFchmod   = 91
-		sysFchmodat = 268
-	)
 	var (
 		mode    uint32
 		absPath string
 		ok      bool
 	)
-	switch n.Data.Nr {
-	case sysChmod: // chmod(path, mode)
+	switch kindOf(n.Data.Nr) {
+	case callChmod: // chmod(path, mode)
 		mode = uint32(n.Data.Args[1])
 		absPath, ok = resolveAtPath(int(n.PID), atFDCWD, uintptr(n.Data.Args[0]))
-	case sysFchmod: // fchmod(fd, mode)
+	case callFchmod: // fchmod(fd, mode)
 		mode = uint32(n.Data.Args[1])
 		absPath, ok = resolveFdPath(int(n.PID), int(int32(n.Data.Args[0])))
 	default: // fchmodat(dirfd, path, mode, flags) and fchmodat2(.., flags)
@@ -1051,20 +1019,20 @@ func (s *Supervisor) handleDelete(n *seccompNotif) seccompNotifResp {
 	}
 	pid := int(n.PID)
 	var errno syscall.Errno
-	switch n.Data.Nr {
-	case 87, 84:
+	switch kindOf(n.Data.Nr) {
+	case callUnlink:
 		p, ok := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
 		if !ok {
 			return cont
 		}
 		errno = g.CheckDelete(pid, p)
-	case 263:
+	case callUnlinkat:
 		p, ok := resolveAtPath(pid, int(int32(n.Data.Args[0])), uintptr(n.Data.Args[1]))
 		if !ok {
 			return cont
 		}
 		errno = g.CheckDelete(pid, p)
-	case 82:
+	case callRename:
 		from, ok1 := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
 		to, ok2 := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[1]))
 		if !ok1 || !ok2 {
@@ -1084,6 +1052,30 @@ func (s *Supervisor) handleDelete(n *seccompNotif) seccompNotifResp {
 		return seccompNotifResp{ID: n.ID, Error: -int32(errno)}
 	}
 	return cont
+}
+
+// openTarget returns the guest-absolute path and open flags of an open,
+// openat, openat2 or creat notification.
+func openTarget(n *seccompNotif) (string, int, bool) {
+	pid := int(n.PID)
+	switch kindOf(n.Data.Nr) {
+	case callOpen:
+		p, ok := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
+		return p, int(n.Data.Args[1]), ok
+	case callCreat:
+		p, ok := resolveAtPath(pid, atFDCWD, uintptr(n.Data.Args[0]))
+		return p, unix.O_CREAT | unix.O_WRONLY | unix.O_TRUNC, ok
+	case callOpenat2:
+		how, err := readBytesFromProcess(pid, uintptr(n.Data.Args[2]), 8)
+		if err != nil || len(how) < 8 {
+			return "", 0, false
+		}
+		p, ok := resolveAtPath(pid, int(int32(n.Data.Args[0])), uintptr(n.Data.Args[1]))
+		return p, int(binary.NativeEndian.Uint64(how)), ok
+	default:
+		p, ok := resolveAtPath(pid, int(int32(n.Data.Args[0])), uintptr(n.Data.Args[1]))
+		return p, int(n.Data.Args[2]), ok
+	}
 }
 
 // resolveAtPath turns a (dirfd, pathptr) pair from the guest into a guest-

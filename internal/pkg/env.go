@@ -18,6 +18,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/singularityos-lab/ush/internal/arch"
 )
 
 // androidRepository is Google's SDK manifest; it lists every SDK archive with
@@ -47,7 +49,7 @@ var environments = []Environment{
 			return []string{
 				"ANDROID_HOME=" + sdk,
 				"ANDROID_SDK_ROOT=" + sdk,
-				"JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64",
+				"JAVA_HOME=/usr/lib/jvm/java-17-openjdk-" + arch.Debian(),
 				"PATH+=" + strings.Join([]string{
 					filepath.Join(sdk, "cmdline-tools", "latest", "bin"),
 					filepath.Join(sdk, "platform-tools"),
@@ -297,7 +299,7 @@ func setupAndroid(ctx context.Context, dir string, stdin io.Reader, stdout, stde
 			return err
 		}
 	}
-	env := append(os.Environ(), "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64", "ANDROID_HOME="+sdk)
+	env := append(os.Environ(), "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-"+arch.Debian(), "ANDROID_HOME="+sdk)
 	fmt.Fprintln(stdout, "pkg env: review and accept the Android SDK licenses")
 	licenses := exec.CommandContext(ctx, sdkmanager, "--sdk_root="+sdk, "--licenses")
 	licenses.Env, licenses.Stdin, licenses.Stdout, licenses.Stderr = env, stdin, stdout, stderr

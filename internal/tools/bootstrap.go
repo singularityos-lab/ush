@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/singularityos-lab/ush/internal/arch"
 	ushlog "github.com/singularityos-lab/ush/internal/log"
 	"github.com/ulikunitz/xz"
 )
@@ -32,7 +33,6 @@ const (
 	// Debian stable mirror (bookworm) - HTTPS to prevent MITM.
 	debianMirror = "https://deb.debian.org/debian"
 	debianDist   = "bookworm"
-	debianArch   = "amd64"
 )
 
 // Minimal packages required for apt-get + dpkg.
@@ -185,28 +185,32 @@ func EnsureApt() error {
 	// Download into the per-user tree, never ToolsDir(): if a pre-baked system
 	// tree exists it is read-only, and in that case AptGetPath already returned
 	// above so we would not be here anyway. Being explicit keeps it that way.
-	return bootstrapInto(UserToolsDir())
+	return bootstrapInto(UserToolsDir(), arch.Debian())
 }
 
 // BakeToolsInto populates a tools tree at an arbitrary path so an image build can
 // pre-stage it at SystemToolsDir. Same code and same package set as the runtime
 // bootstrap, so what ships is exactly what the download would have produced.
 // Build-time only: needs network and writes to dir.
-func BakeToolsInto(dir string) error {
-	fmt.Fprintf(os.Stderr, "USH: baking apt/dpkg tools into %s\n", dir)
-	return bootstrapInto(dir)
+func BakeToolsInto(dir, goarch string) error {
+	debArch, err := arch.DebianFor(goarch)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "USH: baking %s apt/dpkg tools into %s\n", debArch, dir)
+	return bootstrapInto(dir, debArch)
 }
 
 // bootstrapInto downloads and extracts the required Debian packages into toolsDir,
 // then ensures the apt method drivers are present.
-func bootstrapInto(toolsDir string) error {
+func bootstrapInto(toolsDir, debArch string) error {
 	if err := os.MkdirAll(toolsDir, 0755); err != nil {
 		return fmt.Errorf("tools: mkdir %s: %w", toolsDir, err)
 	}
 
 	// Download the package index to find the exact URLs.
 	fmt.Fprintf(os.Stderr, "USH: fetching package index from Debian %s...\n", debianDist)
-	pkgIndex, err := fetchPackageIndex()
+	pkgIndex, err := fetchPackageIndex(debArch)
 	if err != nil {
 		return fmt.Errorf("tools: cannot reach Debian mirror (%s), check your internet connection: %w", debianMirror, err)
 	}
@@ -310,9 +314,9 @@ func ensureMethodsSymlinksIn(toolsDir string) {
 }
 
 // fetchPackageIndex downloads and returns the Packages index from mirror.
-func fetchPackageIndex() (string, error) {
+func fetchPackageIndex(debArch string) (string, error) {
 	url := fmt.Sprintf("%s/dists/%s/main/binary-%s/Packages.gz",
-		debianMirror, debianDist, debianArch)
+		debianMirror, debianDist, debArch)
 	data, err := downloadURL(url)
 	if err != nil {
 		return "", err

@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -37,6 +38,7 @@ import (
 
 	"os/exec"
 
+	"github.com/singularityos-lab/ush/internal/arch"
 	"github.com/singularityos-lab/ush/internal/broker"
 	"github.com/singularityos-lab/ush/internal/config"
 	"github.com/singularityos-lab/ush/internal/devpolicy"
@@ -88,7 +90,11 @@ func run() error {
 	// before the flag parse (which would otherwise take the dir as a script) and
 	// before any namespace work. The image build calls it; users never do.
 	if len(os.Args) >= 3 && os.Args[1] == "--bake-tools" {
-		return tools.BakeToolsInto(os.Args[2])
+		goarch := runtime.GOARCH
+		if len(os.Args) == 5 && os.Args[3] == "--arch" {
+			goarch = os.Args[4]
+		}
+		return tools.BakeToolsInto(os.Args[2], goarch)
 	}
 
 	// Developer userns stub: the first exec after an unmapped clone(CLONE_NEWUSER)
@@ -1407,9 +1413,9 @@ func addPkgPrefixToPath(prefix string) {
 	os.Setenv("PATH", strings.Join(binPaths, ":")+":"+existing)
 
 	libPaths := []string{
-		filepath.Join(prefix, "usr", "lib", "x86_64-linux-gnu"),
+		filepath.Join(prefix, "usr", "lib", arch.Triplet()),
 		filepath.Join(prefix, "usr", "lib"),
-		filepath.Join(prefix, "lib", "x86_64-linux-gnu"),
+		filepath.Join(prefix, "lib", arch.Triplet()),
 		filepath.Join(prefix, "lib"),
 	}
 	// Dev: register the pkg-layer libs through /etc/ld.so.conf.d + ldconfig

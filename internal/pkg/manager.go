@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/singularityos-lab/ush/internal/arch"
 	"github.com/singularityos-lab/ush/internal/broker"
 	"github.com/singularityos-lab/ush/internal/fs"
 	ushlog "github.com/singularityos-lab/ush/internal/log"
@@ -430,7 +431,7 @@ func (m *Manager) fixDirectDpkg(ctx context.Context, stdout, stderr io.Writer) e
 
 	toolsDir := os.Getenv("USH_TOOLS_DIR")
 	if toolsDir != "" && strings.HasPrefix(dpkgBin, toolsDir) {
-		ldPath := filepath.Join(toolsDir, "usr", "lib", "x86_64-linux-gnu") + ":" +
+		ldPath := filepath.Join(toolsDir, "usr", "lib", arch.Triplet()) + ":" +
 			filepath.Join(toolsDir, "usr", "lib")
 		if existing := os.Getenv("LD_LIBRARY_PATH"); existing != "" {
 			ldPath += ":" + existing
@@ -809,10 +810,10 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// toolsDir path is not visible there, so the guest path must lead.
 		const guestExec = "/run/ush/exec"
 		guestLib := guestExec + "/lib"
-		toolsLib := filepath.Join(toolsDir, "usr", "lib", "x86_64-linux-gnu")
+		toolsLib := filepath.Join(toolsDir, "usr", "lib", arch.Triplet())
 		toolsLib2 := filepath.Join(toolsDir, "usr", "lib")
 		existing := os.Getenv("LD_LIBRARY_PATH")
-		ldPath := guestLib + ":" + guestLib + "/x86_64-linux-gnu:" + toolsLib + ":" + toolsLib2
+		ldPath := guestLib + ":" + guestLib + "/" + arch.Triplet() + ":" + toolsLib + ":" + toolsLib2
 		if existing != "" {
 			ldPath += ":" + existing
 		}
@@ -855,8 +856,8 @@ func (m *Manager) runApt(ctx context.Context, stdout, stderr io.Writer, args ...
 		// The guest is not Debian, so apt cannot infer the arch from the base
 		// system: without this it fails with "Unable to determine a suitable
 		// packaging system type" / "Error reading the CPU table". The bootstrap
-		// only fetches amd64 packages, so pin it explicitly.
-		extraArgs = append(extraArgs, "-o", "APT::Architecture=amd64")
+		// only fetches packages for the running architecture, so pin it explicitly.
+		extraArgs = append(extraArgs, "-o", "APT::Architecture="+arch.Debian())
 
 		// apt 2.6 still shells out to apt-key at a hard-coded /usr/bin path for
 		// the clearsigned InRelease check; point it at the staged copy so it can
@@ -1029,16 +1030,16 @@ func cleanupCoreLibsFromPkgroot(pkgPrefix string) {
 
 // ensureDevGlibcSymlinks points the dev pkgroot's multiarch core libs at the host
 // glibc. The Debian libc6 runtime is excluded from the pkgroot (host-shadow
-// safety), so the libc6-dev linker-script's GROUP( /lib/x86_64-linux-gnu/libc.so.6 )
+// safety), so the libc6-dev linker-script's GROUP( /lib/<triplet>/libc.so.6 )
 // has no target and linking fails. The guest is already merged-usr
-// (/lib -> /usr/lib), so /lib/x86_64-linux-gnu/libc.so.6 resolves to
-// /usr/lib/x86_64-linux-gnu/libc.so.6 in the overlay; a symlink there to the host
+// (/lib -> /usr/lib), so /lib/<triplet>/libc.so.6 resolves to
+// /usr/lib/<triplet>/libc.so.6 in the overlay; a symlink there to the host
 // glibc (/usr/lib/<lib>, exposed by the overlay lower) lets the link resolve. The
 // loader is left untouched (host PT_INTERP), so link and run use one glibc and the
 // host is never shadowed. Only libs the host actually provides are linked, so no
 // dangling targets appear.
 func ensureDevGlibcSymlinks(pkgPrefix string) {
-	multiarch := filepath.Join(pkgPrefix, "usr", "lib", "x86_64-linux-gnu")
+	multiarch := filepath.Join(pkgPrefix, "usr", "lib", arch.Triplet())
 	if err := os.MkdirAll(multiarch, 0o755); err != nil {
 		ushlog.Warn("pkg: dev glibc symlink dir failed", "dir", multiarch, "err", err)
 		return

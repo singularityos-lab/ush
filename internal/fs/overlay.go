@@ -31,6 +31,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/singularityos-lab/ush/internal/arch"
 	ushlog "github.com/singularityos-lab/ush/internal/log"
 	"github.com/singularityos-lab/ush/internal/preload"
 	"golang.org/x/sys/unix"
@@ -972,7 +973,7 @@ func fixResolvConf(path string) {
 func (g *GuestFS) seedUsrSkeleton(pkgUsr string) {
 	dirs := []string{
 		"share/debconf",
-		"lib", "lib/x86_64-linux-gnu", "bin", "sbin", "include",
+		"lib", "lib/" + arch.Triplet(), "bin", "sbin", "include",
 		"share", "share/doc", "share/man", "share/locale", "share/fontconfig",
 		"share/applications", "share/icons", "share/misc", "share/pkgconfig",
 	}
@@ -2142,14 +2143,14 @@ func (g *GuestFS) blockPackageManagers() error {
 		// If ToolsDir contains libs (needed for dynamic apt), stage them into
 		// ush-exec/lib so ld.so finds them at the guest-visible /run/ush/exec/lib.
 		// Copy EVERY lib dir, not just the first: the apt-get binary links against
-		// libapt-private.so.0.0 which lives only in usr/lib/x86_64-linux-gnu, while
+		// libapt-private.so.0.0 which lives only in the multiarch lib dir, while
 		// the earlier-matching usr/lib holds just the apt/dpkg method dirs. Breaking
 		// on the first match left libapt-private out and apt-get died with
 		// "error while loading shared libraries: libapt-private.so.0.0".
 		if g.ToolsDir != "" {
 			dst := filepath.Join(ushExecHost, "lib")
 			os.MkdirAll(dst, 0755)
-			for _, libDir := range []string{"usr/lib", "usr/lib/x86_64-linux-gnu", "lib", "lib/x86_64-linux-gnu"} {
+			for _, libDir := range []string{"usr/lib", "usr/lib/" + arch.Triplet(), "lib", "lib/" + arch.Triplet()} {
 				src := filepath.Join(g.ToolsDir, libDir)
 				if fi, err := os.Stat(src); err == nil && fi.IsDir() {
 					copyDirContents(src, dst) //nolint:errcheck

@@ -98,6 +98,32 @@ make uninstall   # remove binaries and the broker service
 
 Binaries go to `~/.local/bin`; the broker unit to `~/.config/systemd/user`.
 
+## cpak from ush
+
+The interactive ush shell sends these commands to the host broker:
+
+```sh
+cpak doctor
+cpak list
+cpak install https://github.com/owner/repo
+cpak install --flatpak com.example.App
+cpak run package
+cpak update package
+cpak remove package
+```
+
+Each command requires confirmation on the host. Applications use the host's
+cpak storage, outside the ush overlay. The broker runs `/usr/bin/cpak` with its
+own environment and working directory; the guest passes only the operation,
+package and terminal input/output. Updates refuse additional permissions.
+
+Local installers, custom binaries, application arguments, permission overrides
+and other CLI options are not forwarded. Scripts that invoke the cpak binary
+directly still run inside ush. In dsh, `cpak` keeps running locally.
+
+Landlock and seccomp remain active in ush. This bridge authorizes a specific
+host action; it does not give the shell access to the host session bus.
+
 ## Storage
 
 ```

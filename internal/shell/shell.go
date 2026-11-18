@@ -194,6 +194,9 @@ func (sh *Shell) execDispatch(next interp.ExecHandlerFunc) interp.ExecHandlerFun
 		}
 
 		cmd := filepath.Base(args[0])
+		if args[0] == "cpak" && os.Getenv("USH_PROFILE") != "dev" {
+			return sh.builtinCpak(ctx, args[1:])
+		}
 
 		switch args[0] {
 		case "ush:fg", "ush:bg", "ush:jobs":

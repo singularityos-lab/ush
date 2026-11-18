@@ -19,6 +19,7 @@ package broker
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -63,8 +64,9 @@ type rpcRequest struct {
 	// and Detail is its argument (the target path, the port), empty for a plain
 	// root shell. The path in Detail is already confined by sdbd; the broker only
 	// mediates the privilege on it.
-	Action string `json:"action,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	Action string       `json:"action,omitempty"`
+	Detail string       `json:"detail,omitempty"`
+	Cpak   *CpakRequest `json:"cpak,omitempty"`
 }
 
 // rpcResponse is the broker's reply.
@@ -130,9 +132,13 @@ func (s *Server) serve() {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	r := bufio.NewReader(conn)
+	r := bufio.NewReader(io.LimitReader(conn, 64<<10))
 	var req rpcRequest
 	if err := readMessage(r, &req); err != nil {
+		return
+	}
+	if req.Method == "Cpak" {
+		s.serveCpak(conn, req, peerFromConn(conn))
 		return
 	}
 	resp := s.dispatchFrom(req, peerFromConn(conn))

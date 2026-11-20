@@ -79,7 +79,7 @@ func TestOriginBanner(t *testing.T) {
 // The banner leads the dialog reason: a caller-supplied reason must not be able
 // to push the remote warning out of view, nor forge one with control characters.
 func TestRemoteReasonLeadsWithBanner(t *testing.T) {
-	got := remoteReason("read the build log", parseOrigin(SDBOrigin("workstation")))
+	got := remoteReason("read the build log", parseOrigin(SDBOrigin("workstation")), false)
 	if !strings.HasPrefix(got, "REQUESTED REMOTELY") {
 		t.Errorf("reason = %q, want it to start with the remote banner", got)
 	}
@@ -87,7 +87,7 @@ func TestRemoteReasonLeadsWithBanner(t *testing.T) {
 		t.Errorf("reason = %q, want it to keep the caller reason", got)
 	}
 
-	forged := remoteReason("x", parseOrigin(SDBOrigin("safe\nlocal request")))
+	forged := remoteReason("x", parseOrigin(SDBOrigin("safe\nlocal request")), false)
 	if strings.Count(strings.SplitN(forged, "\n\n", 2)[0], "\n") != 0 {
 		t.Errorf("banner is multi-line, a label can forge dialog lines: %q", forged)
 	}

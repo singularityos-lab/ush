@@ -179,6 +179,24 @@ func (d *dbusManager) SetSdbEnabled(enabled bool) (bool, bool, string, *dbus.Err
 	return ok, active, message, nil
 }
 
+func (d *dbusManager) SdbAutoApprove() (bool, *dbus.Error) {
+	return d.s.sdbAutoApprove(), nil
+}
+
+func (d *dbusManager) SetSdbAutoApprove(enabled bool) *dbus.Error {
+	if err := d.s.setSdbAutoApprove(enabled); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
+func (d *dbusManager) ResetSdbApprovals() *dbus.Error {
+	if err := d.s.resetSdbApprovals(); err != nil {
+		return dbus.MakeFailedError(err)
+	}
+	return nil
+}
+
 // SixStatus and SetSixEnabled back the developer switch for the experimental
 // kernel. See six.go.
 func (d *dbusManager) SixStatus() (bool, string, *dbus.Error) {
@@ -286,6 +304,13 @@ var managementIntrospectXML = `
       <arg name="active" type="b" direction="out"/>
       <arg name="message" type="s" direction="out"/>
     </method>
+    <method name="SdbAutoApprove">
+      <arg name="enabled" type="b" direction="out"/>
+    </method>
+    <method name="SetSdbAutoApprove">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <method name="ResetSdbApprovals"/>
     <method name="SixStatus">
       <arg name="available" type="b" direction="out"/>
       <arg name="state" type="s" direction="out"/>
@@ -313,6 +338,8 @@ type Server struct {
 	inflight   map[string]*inflightPermission
 	auto       *autoDecider // non-interactive decision mode (testing/CI)
 	storageDir string       // for the dsh opt-in marker (see internal/devpolicy)
+	sdbSession map[string]bool
+	dialog     func(category, resource, reason string) string
 
 	// portalProbe bounds the first lookup of the DE permission Portal so a
 	// request arriving during session startup (before the shell has registered
@@ -344,6 +371,7 @@ func NewServer(storageDir string) (*Server, error) {
 		inflight:   make(map[string]*inflightPermission),
 		auto:       newAutoDecider(),
 		storageDir: storageDir,
+		sdbSession: make(map[string]bool),
 	}, nil
 }
 
@@ -508,7 +536,14 @@ func (s *Server) requestPermissionFrom(
 func (s *Server) requestRemotePermission(
 	category, resource, reason, sessionID string, origin Origin,
 ) string {
-	dialogReason := remoteReason(reason, origin)
+	decision, _ := s.askRemote(category, resource, reason, sessionID, origin, false)
+	return decision
+}
+
+func (s *Server) askRemote(
+	category, resource, reason, sessionID string, origin Origin, rememberable bool,
+) (decision, raw string) {
+	dialogReason := remoteReason(reason, origin, rememberable)
 
 	if s.auto != nil && s.auto.enabled {
 		ushlog.Warn("broker: remote permission refused, no user present to approve it",
@@ -523,11 +558,15 @@ func (s *Server) requestRemotePermission(
 			Origin:    origin.auditValue(),
 			Reason:    dialogReason,
 		})
-		return "deny"
+		return "deny", "deny"
 	}
 
-	decision := s.showDialog(category, resource, dialogReason)
-	switch decision {
+	if s.dialog != nil {
+		raw = s.dialog(category, resource, dialogReason)
+	} else {
+		raw = s.showDialog(category, resource, dialogReason)
+	}
+	switch raw {
 	case "allow", "allow_session", "allow_always":
 		decision = "allow"
 	default:
@@ -546,16 +585,19 @@ func (s *Server) requestRemotePermission(
 	})
 
 	ushlog.Info("broker: user decision on remote request",
-		"decision", decision, "origin", origin.auditValue())
-	return decision
+		"decision", raw, "origin", origin.auditValue())
+	return decision, raw
 }
 
 // remoteReason puts the remote banner first, so the fact that the action was not
 // started on this machine is the first thing read and cannot be pushed out of
 // view by a long caller-supplied reason.
-func remoteReason(reason string, origin Origin) string {
+func remoteReason(reason string, origin Origin, rememberable bool) string {
 	banner := origin.banner()
 	detail := "Approving grants this one action only. It is not remembered."
+	if rememberable {
+		detail = "Always and this session apply to this computer and this kind of action. Settings, Developer can forget them."
+	}
 	if reason == "" {
 		return banner + "\n\n" + detail
 	}

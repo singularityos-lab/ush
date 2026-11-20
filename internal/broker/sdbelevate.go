@@ -12,8 +12,9 @@
 //
 //   - It is always the REMOTE path. An elevation started by the bridge is never
 //     local, so the request is forced remote here even if the caller omitted the
-//     origin: the dialog always shows the remote banner, the request never reads
-//     a local "always allow" rule, and it is never remembered.
+//     origin: the dialog always shows the remote banner and the request never
+//     reads a local "always allow" rule. An answer the person gives a paired
+//     host is kept only for that host's key and that action (see sdbtrust.go).
 //   - It is fail-closed. An unknown action, a missing required argument, or the
 //     absence of a user to approve (headless / scripted mode) all deny WITHOUT
 //     acting. sdbd, on a denial, keeps the action unprivileged; it never fails
@@ -47,8 +48,7 @@ const sdbElevateCategory = "sdb-elevate"
 // may now perform the action it described.
 func (s *Server) sdbElevate(action, detail, sessionID string, origin Origin) (granted bool, reason string) {
 	// An elevation is always a bridge action. Force the remote path so a caller
-	// that sent no origin (or a local one) still gets the remote banner and the
-	// narrowed, never-remembered handling.
+	// that sent no origin (or a local one) still gets the remote banner.
 	if !origin.Remote {
 		origin = Origin{Remote: true, Kind: "unknown"}
 	}
@@ -73,11 +73,21 @@ func (s *Server) sdbElevate(action, detail, sessionID string, origin Origin) (gr
 		}
 	}
 
-	decision := s.requestRemotePermission(sdbElevateCategory, resource, prompt, sessionID, origin)
-	if decision == "allow" {
-		return true, "granted"
+	rememberable := origin.Kind == OriginKindSDB && sessionID != ""
+	if rememberable {
+		if source, ok := s.sdbRemembered(sessionID, action); ok {
+			s.auditSdbGrant(resource, sessionID, source, origin)
+			return true, "granted"
+		}
 	}
-	return false, "denied"
+	decision, raw := s.askRemote(sdbElevateCategory, resource, prompt, sessionID, origin, rememberable)
+	if decision != "allow" {
+		return false, "denied"
+	}
+	if rememberable {
+		s.sdbRemember(sessionID, action, raw)
+	}
+	return true, "granted"
 }
 
 // sdbElevateDescribe validates one request and renders the dialog resource and

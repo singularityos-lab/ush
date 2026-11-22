@@ -180,3 +180,66 @@ func newElevateServer(t *testing.T) *Server {
 	}
 	return srv
 }
+
+// A system write can replace any file on the device, so on a LOCKED device it is
+// refused before any dialog, exactly like a root shell.
+func TestSdbElevateWriteSystemRefusedOnLockedDevice(t *testing.T) {
+	t.Setenv("USH_BROKER_AUTO", "allow_always")
+	agent := &mockAgent{lockBody: LockState{Locked: true}}
+	startMockAgent(t, agent)
+	srv := newElevateServer(t)
+
+	granted, reason := srv.sdbElevate(sdbElevateWriteSystem, "/usr/bin/sdbd", "sess-1", parseOrigin(SDBOrigin("ws")))
+	if granted {
+		t.Fatal("system write granted on a locked device, want refused")
+	}
+	if !strings.Contains(reason, "locked") || !strings.Contains(reason, "system write") {
+		t.Fatalf("reason=%q, want a 'locked' system write refusal", reason)
+	}
+}
+
+func TestSdbElevateWriteSystemRefusedWhenLockStateUnavailable(t *testing.T) {
+	t.Setenv("USH_BROKER_AUTO", "allow_always")
+	t.Setenv("USH_ATOM_RECOVERY_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
+	srv := newElevateServer(t)
+
+	granted, reason := srv.sdbElevate(sdbElevateWriteSystem, "/etc/hosts", "sess-1", parseOrigin(SDBOrigin("ws")))
+	if granted {
+		t.Fatal("system write granted with unreadable lock state, want refused")
+	}
+	if !strings.Contains(reason, "unavailable") {
+		t.Fatalf("reason=%q, want an 'unavailable' refusal", reason)
+	}
+}
+
+// A remembered "always" answer for a host must not outlive a locked bootloader:
+// the gate runs before the remembered grant is consulted.
+func TestSdbElevateRememberedWriteSystemStillNeedsARootedDevice(t *testing.T) {
+	t.Setenv("USH_BROKER_AUTO", "allow_always")
+	agent := &mockAgent{lockBody: LockState{Locked: true}}
+	startMockAgent(t, agent)
+	srv := newElevateServer(t)
+	srv.sdbRemember("sess-1", sdbElevateWriteSystem, "allow_always")
+
+	if granted, _ := srv.sdbElevate(sdbElevateWriteSystem, "/etc/hosts", "sess-1", parseOrigin(SDBOrigin("ws"))); granted {
+		t.Fatal("a remembered answer granted a system write on a locked device")
+	}
+}
+
+func TestSdbElevateWriteSystemRootedDeviceReachesDialog(t *testing.T) {
+	t.Setenv("USH_BROKER_AUTO", "allow_always")
+	agent := &mockAgent{lockBody: LockState{Locked: false}}
+	startMockAgent(t, agent)
+	srv := newElevateServer(t)
+
+	granted, reason := srv.sdbElevate(sdbElevateWriteSystem, "/etc/hosts", "sess-1", parseOrigin(SDBOrigin("ws")))
+	if granted {
+		t.Fatal("no user present, want denied at the dialog")
+	}
+	if strings.Contains(reason, "locked") || strings.Contains(reason, "unavailable") {
+		t.Fatalf("reason=%q, want the dialog denial (lock gate should have passed)", reason)
+	}
+	if agent.callCount() == 0 {
+		t.Fatal("lock state was never read on a system write request")
+	}
+}

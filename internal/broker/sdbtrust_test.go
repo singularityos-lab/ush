@@ -10,6 +10,7 @@ import (
 func trustServer(t *testing.T, answer string) (*Server, *int) {
 	t.Helper()
 	t.Setenv("USH_BROKER_AUTO", "")
+	startMockAgent(t, &mockAgent{lockBody: LockState{Locked: false}})
 	srv := newElevateServer(t)
 	asked := 0
 	srv.dialog = func(string, string, string) string {

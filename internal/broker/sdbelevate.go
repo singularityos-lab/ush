@@ -39,6 +39,14 @@ const (
 	sdbElevateAssist = "assist"
 )
 
+// sdbElevateNeedsRoot lists the actions that amount to root on the device, with
+// the words a refusal uses for each. A system write can replace any binary or
+// configuration, so it is held to the same rooted-device gate as a root shell.
+var sdbElevateNeedsRoot = map[string]string{
+	sdbElevateShellRoot:   "root shell",
+	sdbElevateWriteSystem: "system write",
+}
+
 // sdbElevateCategory is the audit/dialog category for every elevation request.
 const sdbElevateCategory = "sdb-elevate"
 
@@ -63,13 +71,13 @@ func (s *Server) sdbElevate(action, detail, sessionID string, origin Origin) (gr
 	// whose bootloader is unlocked. Check that BEFORE prompting, and fail closed:
 	// a locked device, or a lock state we cannot read, refuses without a dialog.
 	// A user cannot approve their way to root on a locked device.
-	if action == sdbElevateShellRoot {
+	if what, ok := sdbElevateNeedsRoot[action]; ok {
 		st, err := s.bootloaderLockState()
 		if err != nil {
-			return false, "device root state unavailable: root shell refused"
+			return false, "device root state unavailable: " + what + " refused"
 		}
 		if st.Locked {
-			return false, "device is locked (not rooted): root shell refused"
+			return false, "device is locked (not rooted): " + what + " refused"
 		}
 	}
 
